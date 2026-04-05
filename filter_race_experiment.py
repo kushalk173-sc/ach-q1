@@ -32,10 +32,9 @@ the conjecture
 in a regime with `eps << rho`, under an explicit filtering loss and matched
 resource interpretation.
 
-Optional: install Numba (`pip install numba`) to JIT-compile the forward
-filtering loops (`dual_filter`, `single_filter`, `single_filter_with_beliefs`).
-The math matches the NumPy reference path (float64); without Numba, the same
-reference implementation is used.
+`best_single_filter` τ sweeps are vectorized (one pass, all τ at once) — much
+faster than per-τ loops. Optional Numba JIT still accelerates single-sequence
+`dual_filter` / `single_filter` / `single_filter_with_beliefs` when installed.
 """
 
 import argparse
@@ -274,6 +273,57 @@ def mse_components(theta_true, z_true, theta_hat, z_hat, burnin=0):
     return theta_mse, z_mse, theta_mse + z_mse
 
 
+def batched_single_filter_mse(y, theta_true, z_true, taus, a, b, sigma, burnin):
+    """All single-timescale filters for `taus` in one vectorized pass (BLAS-friendly).
+
+    Emission does not depend on tau, so the likelihood vector is shared across
+    candidates; only transitions differ. Same numerics as separate `single_filter`
+    calls, up to float rounding.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    theta_true = np.asarray(theta_true, dtype=np.float64)
+    z_true = np.asarray(z_true, dtype=np.float64)
+    taus = np.asarray(taus, dtype=np.float64)
+    B = taus.shape[0]
+    T = y.shape[0]
+    sigma = float(sigma)
+
+    transitions = np.stack(
+        [build_transition_matrix(float(tau), float(tau)) for tau in taus], axis=0
+    )
+    state_means = np.array([a * th + b * z for th, z in STATES], dtype=np.float64)
+    theta_vals = np.array([th for th, _ in STATES], dtype=np.float64)
+    z_vals = np.array([z for _, z in STATES], dtype=np.float64)
+
+    belief = np.ones((B, 4), dtype=np.float64) / 4.0
+    acc_theta = np.zeros(B, dtype=np.float64)
+    acc_z = np.zeros(B, dtype=np.float64)
+    n_valid = max(0, T - burnin)
+
+    for t in range(T):
+        belief = np.matmul(transitions, belief[:, :, np.newaxis])[:, :, 0]
+        obs = y[t]
+        log_ll = -0.5 * ((obs - state_means) / sigma) ** 2
+        ll = np.exp(log_ll - np.max(log_ll))
+        belief = belief * ll
+        belief /= np.sum(belief, axis=1, keepdims=True)
+
+        th_hat = np.sum(belief * theta_vals, axis=1)
+        zh_hat = np.sum(belief * z_vals, axis=1)
+        if t >= burnin:
+            acc_theta += (th_hat - theta_true[t]) ** 2
+            acc_z += (zh_hat - z_true[t]) ** 2
+
+    if n_valid == 0:
+        theta_mse = np.full(B, np.nan)
+        z_mse = np.full(B, np.nan)
+    else:
+        theta_mse = acc_theta / n_valid
+        z_mse = acc_z / n_valid
+    joint_mse = theta_mse + z_mse
+    return theta_mse, z_mse, joint_mse
+
+
 def best_single_filter(y, theta_true, z_true, eps, rho, a, b, sigma, n_tau=50, burnin=0):
     if np.isclose(eps, rho):
         theta_hat, z_hat = single_filter(y, eps, a, b, sigma)
@@ -286,23 +336,21 @@ def best_single_filter(y, theta_true, z_true, eps, rho, a, b, sigma, n_tau=50, b
         }
 
     taus = np.logspace(np.log10(eps), np.log10(rho), n_tau)
-    best = None
-
-    for tau_idx, tau in enumerate(taus, start=1):
-        theta_hat, z_hat = single_filter(y, tau, a, b, sigma)
-        theta_mse, z_mse, joint_mse = mse_components(theta_true, z_true, theta_hat, z_hat, burnin=burnin)
-        if best is None or joint_mse < best["joint_mse"]:
-            best = {
-                "best_tau": tau,
-                "theta_mse": theta_mse,
-                "z_mse": z_mse,
-                "joint_mse": joint_mse,
-            }
-        if tau_idx == 1 or tau_idx == len(taus) or tau_idx % max(1, len(taus) // 5) == 0:
-            print(
-                f"    tau sweep {tau_idx:3d}/{len(taus):3d}: tau={tau:0.5f} best_joint={best['joint_mse']:0.4f}",
-                flush=True,
-            )
+    theta_mse_arr, z_mse_arr, joint_mse_arr = batched_single_filter_mse(
+        y, theta_true, z_true, taus, a, b, sigma, burnin
+    )
+    j = int(np.nanargmin(joint_mse_arr))
+    best = {
+        "best_tau": float(taus[j]),
+        "theta_mse": float(theta_mse_arr[j]),
+        "z_mse": float(z_mse_arr[j]),
+        "joint_mse": float(joint_mse_arr[j]),
+    }
+    print(
+        f"    tau sweep batched n_tau={n_tau}: best_tau={best['best_tau']:0.5f} "
+        f"best_joint={best['joint_mse']:0.4f}",
+        flush=True,
+    )
 
     return best
 
