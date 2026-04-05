@@ -20,6 +20,11 @@ Speed: use `--device cuda` when available. On CPU, OnePole uses a vectorized
 input projection; set `--cpu-threads` (or `OMP_NUM_THREADS`) so PyTorch can use
 multiple cores for GRU/MKL. `--torch-compile` can speed CPU too (PyTorch 2+).
 Use `--epoch-log-interval 0` to reduce logging overhead.
+
+**Checkpoints:** by default writes `<output-prefix>.checkpoint.json` after each seed
+(completed rho rows + in-progress seeds). If the run stops, re-launch with the same
+arguments plus `--resume`. Finished runs delete the checkpoint. Use `--fresh-start`
+to ignore an old checkpoint, or `--no-checkpoint` to disable.
 """
 
 import argparse
@@ -371,6 +376,9 @@ def run_rescue_sweep(
     device=None,
     log_interval=100,
     torch_compile=False,
+    checkpoint_path=None,
+    resume=False,
+    config_signature=None,
 ):
     """
     For each rho value:
@@ -399,13 +407,47 @@ def run_rescue_sweep(
     )
 
     results = []
+    resume_at_rho = None
+    resume_seed_rows = None
+
+    if checkpoint_path is not None and config_signature is not None and resume:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"--resume requested but checkpoint not found: {checkpoint_path}"
+            )
+        completed, pr, ps = load_rescue_checkpoint(checkpoint_path, config_signature)
+        results = completed
+        resume_at_rho = pr
+        resume_seed_rows = ps
+        if results:
+            print(
+                f"Resume: loaded {len(results)} completed rho row(s) from checkpoint; "
+                f"next index {len(results)}"
+                + (f", partial rho seed progress restored" if resume_at_rho is not None else ""),
+                flush=True,
+            )
 
     for idx, rho in enumerate(rhos):
         lam = rho / eps
+        if idx < len(results):
+            continue
+
         print(f"\n[rho {idx+1}/{len(rhos)}] lambda={lam:.2f}", flush=True)
 
         seed_rows = []
-        for s in range(n_seeds):
+        start_s = 0
+        if resume_at_rho is not None and idx == resume_at_rho and resume_seed_rows is not None:
+            seed_rows = list(resume_seed_rows)
+            start_s = len(seed_rows)
+            resume_at_rho = None
+            resume_seed_rows = None
+            print(
+                f"  Resuming {len(seed_rows)} seed(s) already done for this rho; "
+                f"continuing from seed {start_s + 1}/{n_seeds}",
+                flush=True,
+            )
+
+        for s in range(start_s, n_seeds):
             seed_tr = base_seed + idx * n_seeds * 2 + s
             seed_ev = seed_tr + 100000
 
@@ -673,6 +715,15 @@ def run_rescue_sweep(
 
             seed_rows.append(row_seed)
 
+            if checkpoint_path is not None and config_signature is not None:
+                save_rescue_checkpoint(
+                    checkpoint_path,
+                    config_signature,
+                    results,
+                    partial_rho_idx=idx,
+                    partial_seed_rows=seed_rows,
+                )
+
         # Aggregate across seeds
         row = {"lambda": lam, "rho": rho}
         for key in seed_rows[0]:
@@ -681,6 +732,15 @@ def run_rescue_sweep(
             row[key] = mean
             row[f"{key}_ci95"] = ci
         results.append(row)
+
+        if checkpoint_path is not None and config_signature is not None:
+            save_rescue_checkpoint(
+                checkpoint_path,
+                config_signature,
+                results,
+                None,
+                None,
+            )
 
         print(
             f"  dual={row['dual_mse']:.4f} single={row['single_mse']:.4f} "
@@ -963,6 +1023,106 @@ def save_rescue_json(results, meta, output_path):
     print(f"Saved JSON to {output_path}")
 
 
+CHECKPOINT_FORMAT = "rescue_decoder_checkpoint_v1"
+
+
+def default_checkpoint_path(output_prefix: Path) -> Path:
+    return output_prefix.parent / f"{output_prefix.name}.checkpoint.json"
+
+
+def build_rescue_config_signature(
+    *,
+    T: int,
+    eps: float,
+    rhos: np.ndarray,
+    a: float,
+    b: float,
+    sigma: float,
+    n_tau: int,
+    n_seeds: int,
+    base_seed: int,
+    n_epochs: int,
+    lr: float,
+    clock_periods: tuple,
+    hidden_dim: int,
+    run_diagnostic_y_gru: bool,
+    run_diagnostic_dual_gru: bool,
+    run_gru_matched: bool,
+    val_frac: float,
+    early_stopping_patience: int,
+    torch_compile: bool,
+    device_str: str,
+) -> dict:
+    """Stable dict for resume validation (must match exactly)."""
+    return {
+        "signature_version": 1,
+        "T": int(T),
+        "eps": float(eps),
+        "rhos": [float(x) for x in np.asarray(rhos, dtype=float).ravel()],
+        "a": float(a),
+        "b": float(b),
+        "sigma": float(sigma),
+        "n_tau": int(n_tau),
+        "n_seeds": int(n_seeds),
+        "base_seed": int(base_seed),
+        "n_epochs": int(n_epochs),
+        "lr": float(lr),
+        "clock_periods": [int(x) for x in clock_periods],
+        "hidden_dim": int(hidden_dim),
+        "run_diagnostic_y_gru": bool(run_diagnostic_y_gru),
+        "run_diagnostic_dual_gru": bool(run_diagnostic_dual_gru),
+        "run_gru_matched": bool(run_gru_matched),
+        "val_frac": float(val_frac),
+        "early_stopping_patience": int(early_stopping_patience),
+        "torch_compile": bool(torch_compile),
+        "device_str": str(device_str),
+    }
+
+
+def _configs_match(a: dict, b: dict) -> bool:
+    if set(a.keys()) != set(b.keys()):
+        return False
+    for k in a:
+        if a[k] != b[k]:
+            return False
+    return True
+
+
+def save_rescue_checkpoint(
+    path: Path,
+    config: dict,
+    completed_results: list,
+    partial_rho_idx: int | None,
+    partial_seed_rows: list | None,
+) -> None:
+    payload = {
+        "format": CHECKPOINT_FORMAT,
+        "config": to_jsonable(config),
+        "completed_results": to_jsonable(completed_results),
+        "partial_rho_idx": partial_rho_idx,
+        "partial_seed_rows": to_jsonable(partial_seed_rows) if partial_seed_rows else None,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_rescue_checkpoint(path: Path, expected_config: dict) -> tuple[list, int | None, list | None]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError(f"Unknown checkpoint format in {path}")
+    cfg = raw["config"]
+    if not _configs_match(cfg, expected_config):
+        raise ValueError(
+            "Checkpoint config does not match this run (T, rhos, seeds, epochs, etc.). "
+            "Use the same CLI as when the checkpoint was written, or delete the checkpoint file."
+        )
+    completed = raw.get("completed_results") or []
+    pr = raw.get("partial_rho_idx")
+    ps = raw.get("partial_seed_rows")
+    if pr is not None and ps is not None:
+        return completed, int(pr), list(ps)
+    return completed, None, None
+
+
 def build_param_counts(hidden_dim, clock_periods, gru_matched_hidden: int):
     return {
         "one_pole": count_parameters(
@@ -1071,6 +1231,27 @@ def parse_args():
         default=0,
         help="PyTorch CPU intra-op threads (0 = OMP_NUM_THREADS if set, else all cores). Speeds CPU GRU/MKL.",
     )
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint JSON path (default: <output-prefix>.checkpoint.json next to outputs).",
+    )
+    p.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Disable checkpoint/resume (no periodic saves).",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from --checkpoint if config matches (same rho grid, T, seeds, etc.).",
+    )
+    p.add_argument(
+        "--fresh-start",
+        action="store_true",
+        help="Delete checkpoint file before running (discard partial progress).",
+    )
     return p.parse_args()
 
 
@@ -1087,12 +1268,47 @@ def main():
         torch.backends.cudnn.benchmark = True
     print(f"PyTorch device: {device}", flush=True)
 
+    ck_path: Path | None = None
+    if not args.no_checkpoint:
+        ck_path = args.checkpoint if args.checkpoint is not None else default_checkpoint_path(args.output_prefix)
+        if args.fresh_start and ck_path.is_file():
+            ck_path.unlink()
+            print(f"Removed checkpoint (--fresh-start): {ck_path}", flush=True)
+        elif ck_path.is_file() and not args.resume:
+            raise SystemExit(
+                f"Checkpoint exists: {ck_path}\n"
+                "Use --resume to continue from it, or --fresh-start to delete it and run from scratch."
+            )
+
     clock_periods = tuple(args.clock_periods)
     hidden_dim = args.hidden_dim
     hm, one_pole_param_target, gru_matched_n = gru_hidden_dim_matched_to_onepole(
         4, hidden_dim
     )
     param_counts = build_param_counts(hidden_dim, clock_periods, hm)
+
+    config_signature = build_rescue_config_signature(
+        T=args.T,
+        eps=args.eps,
+        rhos=rhos,
+        a=args.a,
+        b=args.b,
+        sigma=args.sigma,
+        n_tau=args.n_tau,
+        n_seeds=args.n_seeds,
+        base_seed=args.seed,
+        n_epochs=args.n_epochs,
+        lr=args.lr,
+        clock_periods=clock_periods,
+        hidden_dim=hidden_dim,
+        run_diagnostic_y_gru=not args.no_diagnostic_y,
+        run_diagnostic_dual_gru=not args.no_diagnostic_dual_gru,
+        run_gru_matched=not args.no_gru_matched,
+        val_frac=args.val_frac,
+        early_stopping_patience=args.early_stopping_patience,
+        torch_compile=args.torch_compile,
+        device_str=str(device),
+    )
 
     results = run_rescue_sweep(
         T=args.T,
@@ -1116,6 +1332,9 @@ def main():
         device=device,
         log_interval=args.epoch_log_interval,
         torch_compile=args.torch_compile,
+        checkpoint_path=ck_path,
+        resume=args.resume,
+        config_signature=config_signature if ck_path is not None else None,
     )
 
     meta = {
@@ -1145,6 +1364,10 @@ def main():
     save_rescue_json(results, meta, args.output_prefix.with_suffix(".json"))
     save_rescue_csv(results, args.output_prefix.with_suffix(".csv"))
     make_rescue_plot(results, args.output_prefix.with_suffix(".png"))
+
+    if ck_path is not None and ck_path.is_file():
+        ck_path.unlink()
+        print(f"Removed checkpoint after successful run: {ck_path}", flush=True)
 
 
 if __name__ == "__main__":
