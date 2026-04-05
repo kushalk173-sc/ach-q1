@@ -31,6 +31,11 @@ the conjecture
 
 in a regime with `eps << rho`, under an explicit filtering loss and matched
 resource interpretation.
+
+Optional: install Numba (`pip install numba`) to JIT-compile the forward
+filtering loops (`dual_filter`, `single_filter`, `single_filter_with_beliefs`).
+The math matches the NumPy reference path (float64); without Numba, the same
+reference implementation is used.
 """
 
 import argparse
@@ -38,6 +43,124 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+try:
+    from numba import njit
+
+    _HAVE_NUMBA = True
+
+    @njit(cache=True)
+    def _build_transition_core(eps, rho):
+        th_s = np.array([-1.0, -1.0, 1.0, 1.0])
+        z_s = np.array([-1.0, 1.0, -1.0, 1.0])
+        transition = np.empty((4, 4), dtype=np.float64)
+        for i in range(4):
+            for j in range(4):
+                p_th = eps if th_s[j] != th_s[i] else 1.0 - eps
+                p_z = rho if z_s[j] != z_s[i] else 1.0 - rho
+                transition[j, i] = p_th * p_z
+        return transition
+
+    @njit(cache=True)
+    def _filter_forward_core(y, transition, state_means, sigma, theta_vals, z_vals):
+        """Same math as the NumPy reference loop; float64 throughout."""
+        T = y.shape[0]
+        n = 4
+        belief = np.empty(n, dtype=np.float64)
+        for k in range(n):
+            belief[k] = 1.0 / n
+        theta_est = np.empty(T, dtype=np.float64)
+        z_est = np.empty(T, dtype=np.float64)
+        inv_sig = 1.0 / sigma
+        for t in range(T):
+            new_b = np.empty(n, dtype=np.float64)
+            for j in range(n):
+                s = 0.0
+                for i in range(n):
+                    s += transition[j, i] * belief[i]
+                new_b[j] = s
+            belief = new_b
+
+            obs = y[t]
+            mxl = -1.0e300
+            for k in range(n):
+                d = (obs - state_means[k]) * inv_sig
+                v = -0.5 * d * d
+                if v > mxl:
+                    mxl = v
+            ssum = 0.0
+            for k in range(n):
+                d = (obs - state_means[k]) * inv_sig
+                v = -0.5 * d * d
+                belief[k] *= np.exp(v - mxl)
+                ssum += belief[k]
+            inv = 1.0 / ssum
+            for k in range(n):
+                belief[k] *= inv
+
+            te = 0.0
+            ze = 0.0
+            for k in range(n):
+                te += belief[k] * theta_vals[k]
+                ze += belief[k] * z_vals[k]
+            theta_est[t] = te
+            z_est[t] = ze
+        return theta_est, z_est
+
+    @njit(cache=True)
+    def _filter_with_beliefs_core(y, transition, state_means, sigma, theta_vals, z_vals):
+        T = y.shape[0]
+        n = 4
+        belief = np.empty(n, dtype=np.float64)
+        for k in range(n):
+            belief[k] = 1.0 / n
+        theta_est = np.empty(T, dtype=np.float64)
+        z_est = np.empty(T, dtype=np.float64)
+        beliefs = np.empty((T, n), dtype=np.float64)
+        inv_sig = 1.0 / sigma
+        for t in range(T):
+            new_b = np.empty(n, dtype=np.float64)
+            for j in range(n):
+                s = 0.0
+                for i in range(n):
+                    s += transition[j, i] * belief[i]
+                new_b[j] = s
+            belief = new_b
+
+            obs = y[t]
+            mxl = -1.0e300
+            for k in range(n):
+                d = (obs - state_means[k]) * inv_sig
+                v = -0.5 * d * d
+                if v > mxl:
+                    mxl = v
+            ssum = 0.0
+            for k in range(n):
+                d = (obs - state_means[k]) * inv_sig
+                v = -0.5 * d * d
+                belief[k] *= np.exp(v - mxl)
+                ssum += belief[k]
+            inv = 1.0 / ssum
+            for k in range(n):
+                belief[k] *= inv
+
+            for k in range(n):
+                beliefs[t, k] = belief[k]
+
+            te = 0.0
+            ze = 0.0
+            for k in range(n):
+                te += belief[k] * theta_vals[k]
+                ze += belief[k] * z_vals[k]
+            theta_est[t] = te
+            z_est[t] = ze
+        return theta_est, z_est, beliefs
+
+except ImportError:
+    _HAVE_NUMBA = False
+    _build_transition_core = None
+    _filter_forward_core = None
+    _filter_with_beliefs_core = None
 
 
 STATES = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
@@ -73,15 +196,20 @@ def build_transition_matrix(eps, rho):
 
 
 def dual_filter(y, eps, rho, a, b, sigma):
-    transition = build_transition_matrix(eps, rho)
-    state_means = np.array([a * th + b * z for th, z in STATES], dtype=float)
+    y = np.asarray(y, dtype=np.float64)
+    state_means = np.array([a * th + b * z for th, z in STATES], dtype=np.float64)
+    theta_vals = np.array([th for th, _ in STATES], dtype=np.float64)
+    z_vals = np.array([z for _, z in STATES], dtype=np.float64)
+    sigma = float(sigma)
 
+    if _HAVE_NUMBA:
+        transition = _build_transition_core(eps, rho)
+        return _filter_forward_core(y, transition, state_means, sigma, theta_vals, z_vals)
+
+    transition = build_transition_matrix(eps, rho)
     belief = np.ones(len(STATES), dtype=float) / len(STATES)
     theta_est = np.empty(len(y), dtype=float)
     z_est = np.empty(len(y), dtype=float)
-
-    theta_vals = np.array([th for th, _ in STATES], dtype=float)
-    z_vals = np.array([z for _, z in STATES], dtype=float)
 
     for t, obs in enumerate(y):
         belief = transition @ belief
@@ -109,11 +237,19 @@ def single_filter_with_beliefs(y, tau, a, b, sigma):
         beliefs: (T, 4) full belief vector at each step — this is c_t,
                  the ONLY thing rescue decoders may receive. Never y.
     """
-    transition = build_transition_matrix(tau, tau)
-    state_means = np.array([a * th + b * z for th, z in STATES], dtype=float)
-    theta_vals = np.array([th for th, _ in STATES], dtype=float)
-    z_vals = np.array([z for _, z in STATES], dtype=float)
+    y = np.asarray(y, dtype=np.float64)
+    state_means = np.array([a * th + b * z for th, z in STATES], dtype=np.float64)
+    theta_vals = np.array([th for th, _ in STATES], dtype=np.float64)
+    z_vals = np.array([z for _, z in STATES], dtype=np.float64)
+    sigma = float(sigma)
 
+    if _HAVE_NUMBA:
+        transition = _build_transition_core(tau, tau)
+        return _filter_with_beliefs_core(
+            y, transition, state_means, sigma, theta_vals, z_vals
+        )
+
+    transition = build_transition_matrix(tau, tau)
     belief = np.ones(len(STATES), dtype=float) / len(STATES)
     theta_est = np.empty(len(y), dtype=float)
     z_est = np.empty(len(y), dtype=float)

@@ -15,6 +15,10 @@ weak optimization. Compare GRU(beliefs) vs GRU(y) only as a sanity check.
 HARD PROTOCOL RULE: rescue decoders in the main test receive only belief states
 `c_t` from the single-timescale filter. They never see `y_t` directly. Violation
 of this rule makes the Q3 test meaningless.
+
+Speed: NumPy/Numba filtering is CPU-bound; PyTorch training speeds up with
+`--device cuda` when a GPU is available. Use `--epoch-log-interval 0` to reduce
+I/O during long runs.
 """
 
 import argparse
@@ -40,6 +44,20 @@ from filter_race_experiment import (
 
 def count_parameters(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
+
+
+def resolve_device(name: str) -> torch.device:
+    """auto -> CUDA if available, else CPU."""
+    n = (name or "auto").strip().lower()
+    if n == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if n == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but torch.cuda.is_available() is False.")
+        return torch.device("cuda")
+    if n == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unknown --device {name!r}; use auto, cpu, or cuda.")
 
 
 class OnePoleDecoder(nn.Module):
@@ -142,14 +160,27 @@ class ClockworkDecoder(nn.Module):
         return torch.stack(theta_out).squeeze(-1), torch.stack(z_out).squeeze(-1)
 
 
-def train_decoder(decoder, inputs, theta_true, z_true, n_epochs=600, lr=1e-3, burnin=0):
+def train_decoder(
+    decoder,
+    inputs,
+    theta_true,
+    z_true,
+    n_epochs=600,
+    lr=1e-3,
+    burnin=0,
+    device=None,
+    log_interval=100,
+):
     """Train decoder on `inputs` only (beliefs c_t, or diagnostic y)."""
+    if device is None:
+        device = torch.device("cpu")
+    decoder = decoder.to(device)
     optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
-    x_t = torch.tensor(inputs, dtype=torch.float32)
-    th_t = torch.tensor(theta_true, dtype=torch.float32)
-    z_t = torch.tensor(z_true, dtype=torch.float32)
+    x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
+    th_t = torch.as_tensor(theta_true, dtype=torch.float32, device=device)
+    z_t = torch.as_tensor(z_true, dtype=torch.float32, device=device)
 
     decoder.train()
     for epoch in range(n_epochs):
@@ -161,7 +192,7 @@ def train_decoder(decoder, inputs, theta_true, z_true, n_epochs=600, lr=1e-3, bu
         loss.backward()
         nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
         optimizer.step()
-        if (epoch + 1) % 100 == 0:
+        if log_interval and (epoch + 1) % log_interval == 0:
             print(
                 f"    epoch {epoch + 1}/{n_epochs} loss={loss.item():.5f}",
                 flush=True,
@@ -171,12 +202,14 @@ def train_decoder(decoder, inputs, theta_true, z_true, n_epochs=600, lr=1e-3, bu
     return decoder
 
 
-def eval_decoder(decoder, inputs, theta_true, z_true, burnin=0):
+def eval_decoder(decoder, inputs, theta_true, z_true, burnin=0, device=None):
+    if device is None:
+        device = next(decoder.parameters()).device
     with torch.no_grad():
-        x_t = torch.tensor(inputs, dtype=torch.float32)
+        x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
         th_pred, z_pred = decoder(x_t)
-    th_hat = th_pred.numpy()
-    z_hat = z_pred.numpy()
+    th_hat = th_pred.detach().cpu().numpy()
+    z_hat = z_pred.detach().cpu().numpy()
     _, _, joint_mse = mse_components(theta_true, z_true, th_hat, z_hat, burnin=burnin)
     theta_cls, z_cls, weighted_cls = classification_error_components(
         theta_true, z_true, th_hat, z_hat, burnin=burnin
@@ -211,6 +244,9 @@ def run_rescue_sweep(
     clock_periods=(1, 8, 64),
     hidden_dim=64,
     run_diagnostic_y_gru=True,
+    device=None,
+    log_interval=100,
+    torch_compile=False,
 ):
     """
     For each rho value:
@@ -222,6 +258,9 @@ def run_rescue_sweep(
 
     Train/eval split uses independent sequences. No temporal leakage.
     """
+    if device is None:
+        device = torch.device("cpu")
+
     T_train = T // 2
     T_eval = T - T_train
     burnin = int(1.0 / eps)
@@ -307,6 +346,9 @@ def run_rescue_sweep(
                 print(f"  Training {name}...", flush=True)
                 set_torch_seed(name)
                 decoder = factory()
+                decoder = decoder.to(device)
+                if torch_compile and hasattr(torch, "compile"):
+                    decoder = torch.compile(decoder)  # type: ignore[assignment]
                 train_decoder(
                     decoder,
                     beliefs_tr,
@@ -315,9 +357,16 @@ def run_rescue_sweep(
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
+                    device=device,
+                    log_interval=log_interval,
                 )
                 metrics = eval_decoder(
-                    decoder, beliefs_ev, theta_ev, z_ev, burnin=burnin
+                    decoder,
+                    beliefs_ev,
+                    theta_ev,
+                    z_ev,
+                    burnin=burnin,
+                    device=device,
                 )
                 mse = metrics["joint_mse"]
                 frac = (single_mse - mse) / base_gap if base_gap > 1e-8 else 0.0
@@ -335,6 +384,9 @@ def run_rescue_sweep(
                 y_seq_tr = y_tr.reshape(-1, 1).astype(np.float32)
                 y_seq_ev = y_ev.reshape(-1, 1).astype(np.float32)
                 diag_dec = GRUDecoder(input_dim=1, hidden_dim=hidden_dim)
+                diag_dec = diag_dec.to(device)
+                if torch_compile and hasattr(torch, "compile"):
+                    diag_dec = torch.compile(diag_dec)  # type: ignore[assignment]
                 train_decoder(
                     diag_dec,
                     y_seq_tr,
@@ -343,9 +395,16 @@ def run_rescue_sweep(
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
+                    device=device,
+                    log_interval=log_interval,
                 )
                 diag_y = eval_decoder(
-                    diag_dec, y_seq_ev, theta_ev, z_ev, burnin=burnin
+                    diag_dec,
+                    y_seq_ev,
+                    theta_ev,
+                    z_ev,
+                    burnin=burnin,
+                    device=device,
                 )
                 print(
                     f"    [diagnostic] y->GRU mse={diag_y['joint_mse']:.4f} "
@@ -652,6 +711,24 @@ def parse_args():
         action="store_true",
         help="Skip raw y -> GRU positive control (not part of Q3 protocol).",
     )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=("auto", "cpu", "cuda"),
+        help="PyTorch device for decoder training. auto = CUDA if available. Filtering stays NumPy/CPU.",
+    )
+    p.add_argument(
+        "--epoch-log-interval",
+        type=int,
+        default=100,
+        help="Print training loss every N epochs; 0 = silent (faster logging).",
+    )
+    p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Wrap decoders with torch.compile (PyTorch 2+). First epoch may be slower; often helps GRU on GPU.",
+    )
     return p.parse_args()
 
 
@@ -659,6 +736,11 @@ def main():
     args = parse_args()
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     rhos = np.logspace(np.log10(args.eps), np.log10(args.rho_max), args.n_rho)
+
+    device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    print(f"PyTorch device: {device}", flush=True)
 
     clock_periods = tuple(args.clock_periods)
     hidden_dim = args.hidden_dim
@@ -679,9 +761,13 @@ def main():
         clock_periods=clock_periods,
         hidden_dim=hidden_dim,
         run_diagnostic_y_gru=not args.no_diagnostic_y,
+        device=device,
+        log_interval=args.epoch_log_interval,
+        torch_compile=args.torch_compile,
     )
 
     meta = {
+        "torch_device": str(device),
         "param_counts": param_counts,
         "hidden_dim": hidden_dim,
         "clock_periods": list(clock_periods),
