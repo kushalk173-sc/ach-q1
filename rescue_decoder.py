@@ -1,28 +1,31 @@
 """M3: Rescue decoder experiment for Q3.
 
 Tests whether downstream recurrence can recover information lost
-by the single-timescale encoder. Three decoders are evaluated:
+by the single-timescale encoder. Main decoders:
 
-  - **OnePole**: admissible single-timescale rescue model (matched `hidden_dim`).
-  - **GRU**: strong unconstrained rescue baseline (same `hidden_dim`; parameter
-    count differs — see exported counts / JSON metadata).
-  - **Clockwork**: adversarial multiscale stress test (same `hidden_dim`).
+  - **OnePole**: admissible single-timescale rescue (same `hidden_dim` width).
+  - **GRU** / **Clockwork**: **stress tests**, not equal-budget admissible
+    controls — same `hidden_dim` does **not** mean matched parameter count;
+    gating and multi-clock modules add capacity and multiscale inductive bias.
+  - **gru_matched** (optional): GRU with **smaller** hidden size chosen so total
+    parameters are close to OnePole — addresses “GRU only wins by width.”
 
-**Diagnostic (not part of the admissible Q3 protocol):** a GRU trained on raw
-`y_t` checks that poor rescue from `c_t` is due to the belief bottleneck, not
-weak optimization. Compare GRU(beliefs) vs GRU(y) only as a sanity check.
+**Diagnostics (not Q3 protocol):** `y -> GRU` (raw observations); optional
+`dual beliefs -> GRU` (ceiling beliefs) to check decoder capacity vs bottleneck.
 
-HARD PROTOCOL RULE: rescue decoders in the main test receive only belief states
-`c_t` from the single-timescale filter. They never see `y_t` directly. Violation
-of this rule makes the Q3 test meaningless.
+HARD PROTOCOL RULE: main rescue decoders see only **single-filter** beliefs
+`c_t`. They never see `y_t`. Violation voids the Q3 test.
 
-Speed: NumPy/Numba filtering is CPU-bound; PyTorch training speeds up with
-`--device cuda` when a GPU is available. Use `--epoch-log-interval 0` to reduce
-I/O during long runs.
+Speed: use `--device cuda` when available. On CPU, OnePole uses a vectorized
+input projection; set `--cpu-threads` (or `OMP_NUM_THREADS`) so PyTorch can use
+multiple cores for GRU/MKL. `--torch-compile` can speed CPU too (PyTorch 2+).
+Use `--epoch-log-interval 0` to reduce logging overhead.
 """
 
 import argparse
 import json
+import os
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -33,6 +36,7 @@ import torch.nn as nn
 from filter_race_experiment import (
     simulate,
     dual_filter,
+    dual_filter_with_beliefs,
     single_filter_with_beliefs,
     best_single_filter,
     mse_components,
@@ -60,6 +64,40 @@ def resolve_device(name: str) -> torch.device:
     raise ValueError(f"Unknown --device {name!r}; use auto, cpu, or cuda.")
 
 
+def configure_pytorch_cpu_threads(num_threads: int) -> int:
+    """Cap BLAS/MKL intra-op threads for CPU training (GRU, etc.)."""
+    ncpu = os.cpu_count() or 4
+    if num_threads <= 0:
+        env = int(os.environ.get("OMP_NUM_THREADS", "0") or 0)
+        num_threads = env if env > 0 else ncpu
+    num_threads = max(1, min(int(num_threads), ncpu))
+    torch.set_num_threads(num_threads)
+    interop = max(1, min(4, num_threads // 4 or 1))
+    try:
+        torch.set_num_interop_threads(interop)
+    except RuntimeError:
+        pass
+    return num_threads
+
+
+def gru_hidden_dim_matched_to_onepole(
+    input_dim: int, one_pole_hidden_dim: int, num_layers: int = 2, max_h: int = 512
+):
+    """Pick GRU hidden size so parameter count is closest to OnePoleDecoder."""
+    target = count_parameters(
+        OnePoleDecoder(input_dim=input_dim, hidden_dim=one_pole_hidden_dim, tau=1.0)
+    )
+    best_h, best_n, best_diff = 8, 0, float("inf")
+    for h in range(4, max_h + 1):
+        n = count_parameters(
+            GRUDecoder(input_dim=input_dim, hidden_dim=h, num_layers=num_layers)
+        )
+        d = abs(n - target)
+        if d < best_diff:
+            best_diff, best_h, best_n = d, h, n
+    return best_h, target, best_n
+
+
 class OnePoleDecoder(nn.Module):
     """Minimal admissible single-timescale decoder.
 
@@ -77,16 +115,20 @@ class OnePoleDecoder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, beliefs):
-        # beliefs: (T, input_dim)
-        T = beliefs.shape[0]
-        h = torch.zeros(self.hidden_dim, device=beliefs.device)
-        theta_out, z_out = [], []
+        # beliefs: (T, input_dim) — vectorized input proj; EMA recurrence in-loop
+        x = torch.tanh(self.input_proj(beliefs))
+        T, _ = x.shape
+        device, dtype = x.device, x.dtype
+        h = torch.zeros(self.hidden_dim, device=device, dtype=dtype)
+        alpha = torch.as_tensor(self.alpha, device=device, dtype=dtype)
+        one_m_a = 1.0 - alpha
+        theta_out = torch.empty(T, device=device, dtype=dtype)
+        z_out = torch.empty(T, device=device, dtype=dtype)
         for t in range(T):
-            x = torch.tanh(self.input_proj(beliefs[t]))
-            h = self.alpha * h + (1.0 - self.alpha) * x
-            theta_out.append(self.output_theta(h))
-            z_out.append(self.output_z(h))
-        return torch.stack(theta_out).squeeze(-1), torch.stack(z_out).squeeze(-1)
+            h = alpha * h + one_m_a * x[t]
+            theta_out[t] = self.output_theta(h).squeeze(-1)
+            z_out[t] = self.output_z(h).squeeze(-1)
+        return theta_out, z_out
 
 
 class GRUDecoder(nn.Module):
@@ -130,6 +172,13 @@ class ClockworkDecoder(nn.Module):
         super().__init__()
         self.clock_periods = clock_periods
         n_groups = len(clock_periods)
+        if hidden_dim % n_groups != 0:
+            warnings.warn(
+                f"ClockworkDecoder: hidden_dim={hidden_dim} is not divisible by "
+                f"len(clock_periods)={n_groups}; using effective width "
+                f"{(hidden_dim // n_groups) * n_groups} (group_size={hidden_dim // n_groups}).",
+                stacklevel=2,
+            )
         self.group_size = hidden_dim // n_groups
         actual_hidden = self.group_size * n_groups
         self.input_proj = nn.Linear(input_dim, actual_hidden)
@@ -170,8 +219,18 @@ def train_decoder(
     burnin=0,
     device=None,
     log_interval=100,
+    val_inputs=None,
+    val_theta=None,
+    val_z=None,
+    val_burnin=None,
+    early_stopping_patience=0,
 ):
-    """Train decoder on `inputs` only (beliefs c_t, or diagnostic y)."""
+    """Train decoder on `inputs` only (beliefs c_t, or diagnostic y).
+
+    If ``val_inputs`` is set and ``early_stopping_patience > 0``, train only on
+    ``inputs`` and use the validation sequence for checkpoint selection (lowest
+    joint MSE on the val segment). Otherwise trains on the full ``inputs``.
+    """
     if device is None:
         device = torch.device("cpu")
     decoder = decoder.to(device)
@@ -181,6 +240,23 @@ def train_decoder(
     x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
     th_t = torch.as_tensor(theta_true, dtype=torch.float32, device=device)
     z_t = torch.as_tensor(z_true, dtype=torch.float32, device=device)
+
+    use_es = (
+        val_inputs is not None
+        and val_theta is not None
+        and val_z is not None
+        and early_stopping_patience > 0
+    )
+    if use_es:
+        xv = torch.as_tensor(val_inputs, dtype=torch.float32, device=device)
+        thv = torch.as_tensor(val_theta, dtype=torch.float32, device=device)
+        zv = torch.as_tensor(val_z, dtype=torch.float32, device=device)
+        vb = val_burnin if val_burnin is not None else burnin
+        vb = min(vb, max(0, xv.shape[0] - 1))
+
+    best_state = None
+    best_val = float("inf")
+    stall = 0
 
     decoder.train()
     for epoch in range(n_epochs):
@@ -192,11 +268,29 @@ def train_decoder(
         loss.backward()
         nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
         optimizer.step()
+
+        if use_es:
+            with torch.no_grad():
+                th_p, z_p = decoder(xv)
+                vloss = loss_fn(th_p[vb:], thv[vb:]) + loss_fn(z_p[vb:], zv[vb:])
+                v = float(vloss.item())
+            if v < best_val - 1e-9:
+                best_val = v
+                best_state = {k: v.cpu().clone() for k, v in decoder.state_dict().items()}
+                stall = 0
+            else:
+                stall += 1
+                if stall >= early_stopping_patience:
+                    break
+
         if log_interval and (epoch + 1) % log_interval == 0:
-            print(
-                f"    epoch {epoch + 1}/{n_epochs} loss={loss.item():.5f}",
-                flush=True,
-            )
+            msg = f"    epoch {epoch + 1}/{n_epochs} loss={loss.item():.5f}"
+            if use_es:
+                msg += f" val={v:.5f}"
+            print(msg, flush=True)
+
+    if use_es and best_state is not None:
+        decoder.load_state_dict(best_state)
 
     decoder.eval()
     return decoder
@@ -210,12 +304,16 @@ def eval_decoder(decoder, inputs, theta_true, z_true, burnin=0, device=None):
         th_pred, z_pred = decoder(x_t)
     th_hat = th_pred.detach().cpu().numpy()
     z_hat = z_pred.detach().cpu().numpy()
-    _, _, joint_mse = mse_components(theta_true, z_true, th_hat, z_hat, burnin=burnin)
+    theta_mse, z_mse, joint_mse = mse_components(
+        theta_true, z_true, th_hat, z_hat, burnin=burnin
+    )
     theta_cls, z_cls, weighted_cls = classification_error_components(
         theta_true, z_true, th_hat, z_hat, burnin=burnin
     )
     return {
         "joint_mse": joint_mse,
+        "theta_mse": theta_mse,
+        "z_mse": z_mse,
         "weighted_cls": weighted_cls,
         "theta_cls": theta_cls,
         "z_cls": z_cls,
@@ -227,6 +325,28 @@ def filter_classification_metrics(theta_true, z_true, theta_hat, z_hat, burnin=0
         theta_true, z_true, theta_hat, z_hat, burnin=burnin
     )
     return {"weighted_cls": w, "theta_cls": te, "z_cls": ze}
+
+
+def rescue_fractions(
+    metrics,
+    single_tm,
+    single_zm,
+    single_jm,
+    dual_tm,
+    dual_zm,
+    dual_jm,
+):
+    """Joint and per-latent rescue fractions (MSE; 0 = no rescue, 1 = closes gap)."""
+    gap = single_jm - dual_jm
+    gap_t = single_tm - dual_tm
+    gap_z = single_zm - dual_zm
+    mj = metrics["joint_mse"]
+    mt = metrics["theta_mse"]
+    mz = metrics["z_mse"]
+    frac = (single_jm - mj) / gap if gap > 1e-8 else 0.0
+    frac_t = (single_tm - mt) / gap_t if gap_t > 1e-8 else 0.0
+    frac_z = (single_zm - mz) / gap_z if gap_z > 1e-8 else 0.0
+    return frac, frac_t, frac_z
 
 
 def run_rescue_sweep(
@@ -244,6 +364,10 @@ def run_rescue_sweep(
     clock_periods=(1, 8, 64),
     hidden_dim=64,
     run_diagnostic_y_gru=True,
+    run_diagnostic_dual_gru=True,
+    run_gru_matched=True,
+    val_frac=0.0,
+    early_stopping_patience=0,
     device=None,
     log_interval=100,
     torch_compile=False,
@@ -269,6 +393,10 @@ def run_rescue_sweep(
             f"burnin={burnin} must be < T_train={T_train} and < T_eval={T_eval}. "
             "Increase T or decrease eps."
         )
+
+    hm, one_pole_param_target, gru_matched_param_count = gru_hidden_dim_matched_to_onepole(
+        4, hidden_dim
+    )
 
     results = []
 
@@ -306,7 +434,9 @@ def run_rescue_sweep(
 
             # Dual filter on eval — the ceiling
             dual_th, dual_z = dual_filter(y_ev, eps, rho, a, b, sigma)
-            dual_mse = mse_components(theta_ev, z_ev, dual_th, dual_z, burnin=burnin)[2]
+            dual_tm, dual_zm, dual_mse = mse_components(
+                theta_ev, z_ev, dual_th, dual_z, burnin=burnin
+            )
             dual_cls = filter_classification_metrics(
                 theta_ev, z_ev, dual_th, dual_z, burnin=burnin
             )
@@ -315,25 +445,57 @@ def run_rescue_sweep(
             single_th, single_z, _ = single_filter_with_beliefs(
                 y_ev, tau_star, a, b, sigma
             )
-            single_mse = mse_components(
+            single_tm, single_zm, single_mse = mse_components(
                 theta_ev, z_ev, single_th, single_z, burnin=burnin
-            )[2]
+            )
             single_cls = filter_classification_metrics(
                 theta_ev, z_ev, single_th, single_z, burnin=burnin
             )
 
             base_gap = single_mse - dual_mse
+            gap_theta = single_tm - dual_tm
+            gap_z = single_zm - dual_zm
 
-            # Torch seed offsets — stable across Python versions
+            # Optional train / val split on the training sequence for early stopping
+            if val_frac > 0 and early_stopping_patience > 0:
+                T_fit = int(T_train * (1.0 - val_frac))
+                if T_fit <= burnin or (T_train - T_fit) < max(2, burnin // 2):
+                    raise ValueError(
+                        f"val_frac={val_frac} leaves too few steps after burnin="
+                        f"{burnin}; reduce val_frac or increase T."
+                    )
+                beliefs_fit = beliefs_tr[:T_fit]
+                theta_fit = theta_tr[:T_fit]
+                z_fit = z_tr[:T_fit]
+                beliefs_val = beliefs_tr[T_fit:]
+                theta_val = theta_tr[T_fit:]
+                z_val = z_tr[T_fit:]
+                val_burnin = min(burnin, max(0, len(beliefs_val) - 1))
+                train_kw = {
+                    "val_inputs": beliefs_val,
+                    "val_theta": theta_val,
+                    "val_z": z_val,
+                    "val_burnin": val_burnin,
+                    "early_stopping_patience": early_stopping_patience,
+                }
+            else:
+                beliefs_fit = beliefs_tr
+                theta_fit = theta_tr
+                z_fit = z_tr
+                train_kw = {}
+
             def set_torch_seed(name: str) -> None:
-                off = {"one_pole": 11, "gru": 13, "clockwork": 17, "diag_y_gru": 19}[
-                    name
-                ]
+                off = {
+                    "one_pole": 11,
+                    "gru": 13,
+                    "clockwork": 17,
+                    "gru_matched": 23,
+                    "diag_y_gru": 19,
+                    "diag_dual_gru": 31,
+                }[name]
                 torch.manual_seed((seed_tr + off * 1_000_003 + s * 97) % (2**31))
 
-            # Train and evaluate each rescue decoder (protocol: c_t only)
-            rescue_results = {}
-            for name, factory in [
+            dec_list = [
                 ("one_pole", lambda: OnePoleDecoder(hidden_dim=hidden_dim, tau=tau_star)),
                 ("gru", lambda: GRUDecoder(hidden_dim=hidden_dim)),
                 (
@@ -342,7 +504,12 @@ def run_rescue_sweep(
                         hidden_dim=hidden_dim, clock_periods=clock_periods
                     ),
                 ),
-            ]:
+            ]
+            if run_gru_matched:
+                dec_list.append(("gru_matched", lambda: GRUDecoder(hidden_dim=hm)))
+
+            rescue_results = {}
+            for name, factory in dec_list:
                 print(f"  Training {name}...", flush=True)
                 set_torch_seed(name)
                 decoder = factory()
@@ -351,14 +518,15 @@ def run_rescue_sweep(
                     decoder = torch.compile(decoder)  # type: ignore[assignment]
                 train_decoder(
                     decoder,
-                    beliefs_tr,
-                    theta_tr,
-                    z_tr,
+                    beliefs_fit,
+                    theta_fit,
+                    z_fit,
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
                     device=device,
                     log_interval=log_interval,
+                    **train_kw,
                 )
                 metrics = eval_decoder(
                     decoder,
@@ -368,12 +536,24 @@ def run_rescue_sweep(
                     burnin=burnin,
                     device=device,
                 )
-                mse = metrics["joint_mse"]
-                frac = (single_mse - mse) / base_gap if base_gap > 1e-8 else 0.0
-                rescue_results[name] = {**metrics, "fraction": frac}
+                frac, frac_t, frac_z = rescue_fractions(
+                    metrics,
+                    single_tm,
+                    single_zm,
+                    single_mse,
+                    dual_tm,
+                    dual_zm,
+                    dual_mse,
+                )
+                rescue_results[name] = {
+                    **metrics,
+                    "fraction": frac,
+                    "fraction_theta": frac_t,
+                    "fraction_z": frac_z,
+                }
                 print(
-                    f"    mse={mse:.4f} w_cls={metrics['weighted_cls']:.4f} "
-                    f"fraction={frac:.3f}",
+                    f"    mse={metrics['joint_mse']:.4f} frac={frac:.3f} "
+                    f"frac_theta={frac_t:.3f} frac_z={frac_z:.3f}",
                     flush=True,
                 )
 
@@ -390,13 +570,14 @@ def run_rescue_sweep(
                 train_decoder(
                     diag_dec,
                     y_seq_tr,
-                    theta_tr,
-                    z_tr,
+                    theta_fit,
+                    z_fit,
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
                     device=device,
                     log_interval=log_interval,
+                    **train_kw,
                 )
                 diag_y = eval_decoder(
                     diag_dec,
@@ -412,31 +593,83 @@ def run_rescue_sweep(
                     flush=True,
                 )
 
+            diag_dual = {}
+            if run_diagnostic_dual_gru:
+                print(
+                    "  Training diag_dual_gru (dual beliefs -> GRU, diagnostic)...",
+                    flush=True,
+                )
+                set_torch_seed("diag_dual_gru")
+                _, _, b_dual_tr = dual_filter_with_beliefs(y_tr, eps, rho, a, b, sigma)
+                _, _, b_dual_ev = dual_filter_with_beliefs(y_ev, eps, rho, a, b, sigma)
+                dd = GRUDecoder(input_dim=4, hidden_dim=hidden_dim)
+                dd = dd.to(device)
+                if torch_compile and hasattr(torch, "compile"):
+                    dd = torch.compile(dd)  # type: ignore[assignment]
+                train_decoder(
+                    dd,
+                    b_dual_tr,
+                    theta_fit,
+                    z_fit,
+                    n_epochs=n_epochs,
+                    lr=lr,
+                    burnin=burnin,
+                    device=device,
+                    log_interval=log_interval,
+                    **train_kw,
+                )
+                diag_dual = eval_decoder(
+                    dd, b_dual_ev, theta_ev, z_ev, burnin=burnin, device=device
+                )
+                print(
+                    f"    [diagnostic] dual->GRU mse={diag_dual['joint_mse']:.4f}",
+                    flush=True,
+                )
+
             row_seed = {
                 "dual_mse": dual_mse,
+                "dual_theta_mse": dual_tm,
+                "dual_z_mse": dual_zm,
                 "dual_weighted_cls": dual_cls["weighted_cls"],
                 "dual_theta_cls": dual_cls["theta_cls"],
                 "dual_z_cls": dual_cls["z_cls"],
                 "single_mse": single_mse,
+                "single_theta_mse": single_tm,
+                "single_z_mse": single_zm,
                 "single_weighted_cls": single_cls["weighted_cls"],
                 "single_theta_cls": single_cls["theta_cls"],
                 "single_z_cls": single_cls["z_cls"],
                 "base_gap": base_gap,
+                "gap_theta": gap_theta,
+                "gap_z": gap_z,
                 "tau_star": tau_star,
             }
-            for name in ["one_pole", "gru", "clockwork"]:
-                m = rescue_results[name]
+            for name, m in rescue_results.items():
                 row_seed[f"{name}_mse"] = m["joint_mse"]
+                row_seed[f"{name}_theta_mse"] = m["theta_mse"]
+                row_seed[f"{name}_z_mse"] = m["z_mse"]
                 row_seed[f"{name}_weighted_cls"] = m["weighted_cls"]
                 row_seed[f"{name}_theta_cls"] = m["theta_cls"]
                 row_seed[f"{name}_z_cls"] = m["z_cls"]
                 row_seed[f"{name}_fraction"] = m["fraction"]
+                row_seed[f"{name}_fraction_theta"] = m["fraction_theta"]
+                row_seed[f"{name}_fraction_z"] = m["fraction_z"]
 
             if run_diagnostic_y_gru:
                 row_seed["diag_y_gru_mse"] = diag_y["joint_mse"]
+                row_seed["diag_y_gru_theta_mse"] = diag_y["theta_mse"]
+                row_seed["diag_y_gru_z_mse"] = diag_y["z_mse"]
                 row_seed["diag_y_gru_weighted_cls"] = diag_y["weighted_cls"]
                 row_seed["diag_y_gru_theta_cls"] = diag_y["theta_cls"]
                 row_seed["diag_y_gru_z_cls"] = diag_y["z_cls"]
+
+            if run_diagnostic_dual_gru:
+                row_seed["diag_dual_gru_mse"] = diag_dual["joint_mse"]
+                row_seed["diag_dual_gru_theta_mse"] = diag_dual["theta_mse"]
+                row_seed["diag_dual_gru_z_mse"] = diag_dual["z_mse"]
+                row_seed["diag_dual_gru_weighted_cls"] = diag_dual["weighted_cls"]
+                row_seed["diag_dual_gru_theta_cls"] = diag_dual["theta_cls"]
+                row_seed["diag_dual_gru_z_cls"] = diag_dual["z_cls"]
 
             seed_rows.append(row_seed)
 
@@ -467,10 +700,11 @@ def _ci_band(y, ci):
 
 def make_rescue_plot(results, output_path):
     lambdas = np.array([r["lambda"] for r in results])
+    r0 = results[0] if results else {}
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
 
-    # Top-left: MSE + 95% CI bands
+    # Row 0 left: MSE + 95% CI bands
     ax = axes[0, 0]
     series_mse = [
         ("dual_mse", "Dual filter (ceiling)", "-", None),
@@ -479,7 +713,13 @@ def make_rescue_plot(results, output_path):
         ("gru_mse", "+ GRU (protocol)", "--", "C1"),
         ("clockwork_mse", "+ Clockwork (protocol)", "--", "C2"),
     ]
+    if "gru_matched_mse" in r0:
+        series_mse.append(
+            ("gru_matched_mse", "+ GRU (param-matched)", "--", "C4")
+        )
     for key, label, ls, color in series_mse:
+        if key not in r0:
+            continue
         y = np.array([r[key] for r in results])
         ci = np.array([r[f"{key}_ci95"] for r in results])
         kw = {"linewidth": 2, "linestyle": ls, "label": label}
@@ -489,7 +729,7 @@ def make_rescue_plot(results, output_path):
         lo, hi = _ci_band(y, ci)
         ax.fill_between(lambdas, lo, hi, alpha=0.15, color=color or (0.5, 0.5, 0.5))
 
-    if results and "diag_y_gru_mse" in results[0]:
+    if results and "diag_y_gru_mse" in r0:
         y = np.array([r["diag_y_gru_mse"] for r in results])
         ci = np.array([r["diag_y_gru_mse_ci95"] for r in results])
         ax.plot(
@@ -498,22 +738,43 @@ def make_rescue_plot(results, output_path):
             linewidth=2,
             linestyle=":",
             color="C3",
-            label="GRU | y (diagnostic only)",
+            label="GRU | y (diagnostic)",
         )
         lo, hi = _ci_band(y, ci)
         ax.fill_between(lambdas, lo, hi, alpha=0.15, color="C3")
+    if results and "diag_dual_gru_mse" in r0:
+        y = np.array([r["diag_dual_gru_mse"] for r in results])
+        ci = np.array([r["diag_dual_gru_mse_ci95"] for r in results])
+        ax.plot(
+            lambdas,
+            y,
+            linewidth=2,
+            linestyle="-.",
+            color="C5",
+            label="GRU | dual beliefs (diagnostic)",
+        )
+        lo, hi = _ci_band(y, ci)
+        ax.fill_between(lambdas, lo, hi, alpha=0.12, color="C5")
 
     ax.set_xscale("log")
     ax.set_xlabel("lambda = rho / eps")
     ax.set_ylabel("Joint MSE (eval set)")
-    ax.set_title("Rescue decoder performance (MSE + 95% CI)")
-    ax.legend(fontsize=8, loc="best")
+    ax.set_title("MSE (eval + 95% CI)")
+    ax.legend(fontsize=7, loc="best")
 
-    # Top-right: rescue fraction — MSE-based Q3 statistic
+    # Row 0 right: joint rescue fraction
     ax = axes[0, 1]
-    for name, color in [("one_pole", "C0"), ("gru", "C1"), ("clockwork", "C2")]:
-        fracs = np.array([r[f"{name}_fraction"] for r in results])
-        ci = np.array([r[f"{name}_fraction_ci95"] for r in results])
+    for name, color in [
+        ("one_pole", "C0"),
+        ("gru", "C1"),
+        ("clockwork", "C2"),
+        ("gru_matched", "C4"),
+    ]:
+        k = f"{name}_fraction"
+        if k not in r0:
+            continue
+        fracs = np.array([r[k] for r in results])
+        ci = np.array([r[f"{k}_ci95"] for r in results])
         ax.plot(lambdas, fracs, label=name, linewidth=2, color=color)
         lo, hi = _ci_band(fracs, ci)
         ax.fill_between(lambdas, lo, hi, alpha=0.2, color=color)
@@ -522,11 +783,11 @@ def make_rescue_plot(results, output_path):
     ax.set_xscale("log")
     ax.set_ylim(-0.2, 1.2)
     ax.set_xlabel("lambda = rho / eps")
-    ax.set_ylabel("Rescue fraction (MSE, 0–1)")
-    ax.set_title("Q3: MSE rescue fraction")
-    ax.legend(fontsize=8)
+    ax.set_ylabel("Joint rescue fraction")
+    ax.set_title("Q3: joint MSE rescue fraction")
+    ax.legend(fontsize=7)
 
-    # Bottom-left: weighted classification error + CI
+    # Row 1 left: weighted classification error + CI
     ax = axes[1, 0]
     series_cls = [
         ("dual_weighted_cls", "Dual filter (ceiling)", "-", None),
@@ -535,7 +796,13 @@ def make_rescue_plot(results, output_path):
         ("gru_weighted_cls", "+ GRU (protocol)", "--", "C1"),
         ("clockwork_weighted_cls", "+ Clockwork (protocol)", "--", "C2"),
     ]
+    if "gru_matched_mse" in r0:
+        series_cls.append(
+            ("gru_matched_weighted_cls", "+ GRU matched", "--", "C4")
+        )
     for key, label, ls, color in series_cls:
+        if key not in r0:
+            continue
         y = np.array([r[key] for r in results])
         ci = np.array([r[f"{key}_ci95"] for r in results])
         kw = {"linewidth": 2, "linestyle": ls, "label": label}
@@ -545,7 +812,7 @@ def make_rescue_plot(results, output_path):
         lo, hi = _ci_band(y, ci)
         ax.fill_between(lambdas, lo, hi, alpha=0.15, color=color or (0.5, 0.5, 0.5))
 
-    if results and "diag_y_gru_weighted_cls" in results[0]:
+    if results and "diag_y_gru_weighted_cls" in r0:
         y = np.array([r["diag_y_gru_weighted_cls"] for r in results])
         ci = np.array([r["diag_y_gru_weighted_cls_ci95"] for r in results])
         ax.plot(
@@ -554,23 +821,29 @@ def make_rescue_plot(results, output_path):
             linewidth=2,
             linestyle=":",
             color="C3",
-            label="GRU | y (diagnostic only)",
+            label="GRU | y (diagnostic)",
         )
         lo, hi = _ci_band(y, ci)
         ax.fill_between(lambdas, lo, hi, alpha=0.15, color="C3")
 
     ax.set_xscale("log")
     ax.set_xlabel("lambda = rho / eps")
-    ax.set_ylabel(r"Weighted classification error ($\alpha\epsilon_\theta+\beta\epsilon_z$)")
+    ax.set_ylabel(r"Weighted classification error")
     ax.set_title("Weighted classification error (eval + 95% CI)")
-    ax.legend(fontsize=8, loc="best")
+    ax.legend(fontsize=7, loc="best")
 
-    # Bottom-right: protocol GRU vs diagnostic y->GRU (MSE)
+    # Row 1 right: sanity GRU comparisons (MSE)
     ax = axes[1, 1]
     gru_m = np.array([r["gru_mse"] for r in results])
-    if results and "diag_y_gru_mse" in results[0]:
+    ax.plot(lambdas, gru_m, label="GRU | single beliefs", linewidth=2, color="C1")
+    ax.fill_between(
+        lambdas,
+        *_ci_band(gru_m, np.array([r["gru_mse_ci95"] for r in results])),
+        alpha=0.15,
+        color="C1",
+    )
+    if results and "diag_y_gru_mse" in r0:
         dy = np.array([r["diag_y_gru_mse"] for r in results])
-        ax.plot(lambdas, gru_m, label="GRU | beliefs (protocol)", linewidth=2, color="C1")
         ax.plot(
             lambdas,
             dy,
@@ -581,23 +854,60 @@ def make_rescue_plot(results, output_path):
         )
         ax.fill_between(
             lambdas,
-            *_ci_band(gru_m, np.array([r["gru_mse_ci95"] for r in results])),
-            alpha=0.15,
-            color="C1",
-        )
-        ax.fill_between(
-            lambdas,
             *_ci_band(dy, np.array([r["diag_y_gru_mse_ci95"] for r in results])),
             alpha=0.15,
             color="C3",
         )
-    else:
-        ax.plot(lambdas, gru_m, label="GRU | beliefs (protocol)", linewidth=2)
+    if results and "diag_dual_gru_mse" in r0:
+        dd = np.array([r["diag_dual_gru_mse"] for r in results])
+        ax.plot(
+            lambdas,
+            dd,
+            label="GRU | dual beliefs (diagnostic)",
+            linewidth=2,
+            linestyle="-.",
+            color="C5",
+        )
+        ax.fill_between(
+            lambdas,
+            *_ci_band(dd, np.array([r["diag_dual_gru_mse_ci95"] for r in results])),
+            alpha=0.12,
+            color="C5",
+        )
     ax.set_xscale("log")
     ax.set_xlabel("lambda = rho / eps")
     ax.set_ylabel("Joint MSE (eval)")
-    ax.set_title("Sanity: belief bottleneck vs raw y (diagnostic)")
-    ax.legend(fontsize=8)
+    ax.set_title("Sanity: decoders on different codes")
+    ax.legend(fontsize=7)
+
+    # Row 2: per-latent (theta / z) MSE rescue fractions
+    for col, suffix, title in [
+        (0, "fraction_theta", r"Rescue fraction: $\theta$ (MSE)"),
+        (1, "fraction_z", r"Rescue fraction: $z$ (MSE)"),
+    ]:
+        ax = axes[2, col]
+        for name, color in [
+            ("one_pole", "C0"),
+            ("gru", "C1"),
+            ("clockwork", "C2"),
+            ("gru_matched", "C4"),
+        ]:
+            k = f"{name}_{suffix}"
+            if k not in r0:
+                continue
+            fr = np.array([r[k] for r in results])
+            ci = np.array([r[f"{k}_ci95"] for r in results])
+            ax.plot(lambdas, fr, label=name, linewidth=2, color=color)
+            lo, hi = _ci_band(fr, ci)
+            ax.fill_between(lambdas, lo, hi, alpha=0.2, color=color)
+        ax.axhline(0.0, color="gray", linestyle="--")
+        ax.axhline(1.0, color="gray", linestyle=":")
+        ax.set_xscale("log")
+        ax.set_ylim(-0.2, 1.2)
+        ax.set_xlabel("lambda = rho / eps")
+        ax.set_ylabel("Rescue fraction")
+        ax.set_title(title)
+        ax.legend(fontsize=7)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
@@ -653,16 +963,20 @@ def save_rescue_json(results, meta, output_path):
     print(f"Saved JSON to {output_path}")
 
 
-def build_param_counts(hidden_dim, clock_periods):
+def build_param_counts(hidden_dim, clock_periods, gru_matched_hidden: int):
     return {
         "one_pole": count_parameters(
             OnePoleDecoder(hidden_dim=hidden_dim, tau=1.0)
         ),
         "gru_beliefs": count_parameters(GRUDecoder(hidden_dim=hidden_dim)),
+        "gru_matched": count_parameters(
+            GRUDecoder(hidden_dim=gru_matched_hidden)
+        ),
         "clockwork": count_parameters(
             ClockworkDecoder(hidden_dim=hidden_dim, clock_periods=clock_periods)
         ),
         "diag_gru_y": count_parameters(GRUDecoder(input_dim=1, hidden_dim=hidden_dim)),
+        "diag_dual_gru": count_parameters(GRUDecoder(input_dim=4, hidden_dim=hidden_dim)),
     }
 
 
@@ -712,6 +1026,28 @@ def parse_args():
         help="Skip raw y -> GRU positive control (not part of Q3 protocol).",
     )
     p.add_argument(
+        "--no-diagnostic-dual-gru",
+        action="store_true",
+        help="Skip dual beliefs -> GRU sanity check (not part of Q3 protocol).",
+    )
+    p.add_argument(
+        "--no-gru-matched",
+        action="store_true",
+        help="Skip parameter-matched GRU ablation (vs OnePole count).",
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of train sequence held out for early stopping (0 = disabled).",
+    )
+    p.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop if val joint MSE does not improve for this many epochs (0 = off).",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -727,7 +1063,13 @@ def parse_args():
     p.add_argument(
         "--torch-compile",
         action="store_true",
-        help="Wrap decoders with torch.compile (PyTorch 2+). First epoch may be slower; often helps GRU on GPU.",
+        help="Wrap decoders with torch.compile (PyTorch 2+). Helps GRU on GPU; can help CPU too.",
+    )
+    p.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="PyTorch CPU intra-op threads (0 = OMP_NUM_THREADS if set, else all cores). Speeds CPU GRU/MKL.",
     )
     return p.parse_args()
 
@@ -737,6 +1079,9 @@ def main():
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     rhos = np.logspace(np.log10(args.eps), np.log10(args.rho_max), args.n_rho)
 
+    cpu_threads = configure_pytorch_cpu_threads(args.cpu_threads)
+    print(f"PyTorch CPU threads: {cpu_threads}", flush=True)
+
     device = resolve_device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -744,7 +1089,10 @@ def main():
 
     clock_periods = tuple(args.clock_periods)
     hidden_dim = args.hidden_dim
-    param_counts = build_param_counts(hidden_dim, clock_periods)
+    hm, one_pole_param_target, gru_matched_n = gru_hidden_dim_matched_to_onepole(
+        4, hidden_dim
+    )
+    param_counts = build_param_counts(hidden_dim, clock_periods, hm)
 
     results = run_rescue_sweep(
         T=args.T,
@@ -761,6 +1109,10 @@ def main():
         clock_periods=clock_periods,
         hidden_dim=hidden_dim,
         run_diagnostic_y_gru=not args.no_diagnostic_y,
+        run_diagnostic_dual_gru=not args.no_diagnostic_dual_gru,
+        run_gru_matched=not args.no_gru_matched,
+        val_frac=args.val_frac,
+        early_stopping_patience=args.early_stopping_patience,
         device=device,
         log_interval=args.epoch_log_interval,
         torch_compile=args.torch_compile,
@@ -768,14 +1120,24 @@ def main():
 
     meta = {
         "torch_device": str(device),
+        "torch_cpu_threads": cpu_threads,
+        "T_train": args.T // 2,
+        "T_eval": args.T - args.T // 2,
+        "burnin": int(1.0 / args.eps),
+        "val_frac": args.val_frac,
+        "early_stopping_patience": args.early_stopping_patience,
+        "gru_matched_hidden_dim": hm,
+        "one_pole_param_target_for_match": one_pole_param_target,
+        "gru_matched_param_count": gru_matched_n,
         "param_counts": param_counts,
         "hidden_dim": hidden_dim,
         "clock_periods": list(clock_periods),
         "gru_num_layers": 2,
         "protocol_note": (
-            "OnePole = admissible single-timescale rescue; GRU/Clockwork = "
-            "stress tests with same hidden_dim but different parameter totals "
-            "(see param_counts)."
+            "OnePole = admissible single-timescale rescue. GRU and Clockwork at "
+            "the same hidden_dim are stress tests (different parameter counts; "
+            "multiscale inductive bias). gru_matched approximates OnePole "
+            "parameter count. Diagnostics (y->GRU, dual->GRU) are not Q3 protocol."
         ),
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     }

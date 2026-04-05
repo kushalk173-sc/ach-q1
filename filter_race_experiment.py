@@ -35,9 +35,14 @@ resource interpretation.
 `best_single_filter` τ sweeps are vectorized (one pass, all τ at once) — much
 faster than per-τ loops. Optional Numba JIT still accelerates single-sequence
 `dual_filter` / `single_filter` / `single_filter_with_beliefs` when installed.
+
+Parallelism: use `--workers` > 1 to run independent seeds in separate processes
+(Windows-safe). Each worker sets BLAS/OpenMP to 1 thread to avoid oversubscription.
 """
 
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -223,6 +228,43 @@ def dual_filter(y, eps, rho, a, b, sigma):
     return theta_est, z_est
 
 
+def dual_filter_with_beliefs(y, eps, rho, a, b, sigma):
+    """Dual-timescale filter with full belief trajectory (for diagnostics only).
+
+    Not part of the single-timescale Q3 protocol. Used to test whether a GRU
+    can decode from *optimal* dual beliefs vs single-filter beliefs.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    state_means = np.array([a * th + b * z for th, z in STATES], dtype=np.float64)
+    theta_vals = np.array([th for th, _ in STATES], dtype=np.float64)
+    z_vals = np.array([z for _, z in STATES], dtype=np.float64)
+    sigma = float(sigma)
+
+    if _HAVE_NUMBA:
+        transition = _build_transition_core(eps, rho)
+        return _filter_with_beliefs_core(
+            y, transition, state_means, sigma, theta_vals, z_vals
+        )
+
+    transition = build_transition_matrix(eps, rho)
+    belief = np.ones(len(STATES), dtype=float) / len(STATES)
+    theta_est = np.empty(len(y), dtype=float)
+    z_est = np.empty(len(y), dtype=float)
+    beliefs = np.empty((len(y), len(STATES)), dtype=float)
+
+    for t, obs in enumerate(y):
+        belief = transition @ belief
+        log_ll = -0.5 * ((obs - state_means) / sigma) ** 2
+        ll = np.exp(log_ll - np.max(log_ll))
+        belief *= ll
+        belief /= belief.sum()
+        beliefs[t] = belief
+        theta_est[t] = belief @ theta_vals
+        z_est[t] = belief @ z_vals
+
+    return theta_est, z_est, beliefs
+
+
 def single_filter(y, tau, a, b, sigma):
     return dual_filter(y, eps=tau, rho=tau, a=a, b=b, sigma=sigma)
 
@@ -324,7 +366,7 @@ def batched_single_filter_mse(y, theta_true, z_true, taus, a, b, sigma, burnin):
     return theta_mse, z_mse, joint_mse
 
 
-def best_single_filter(y, theta_true, z_true, eps, rho, a, b, sigma, n_tau=50, burnin=0):
+def best_single_filter(y, theta_true, z_true, eps, rho, a, b, sigma, n_tau=50, burnin=0, verbose=True):
     if np.isclose(eps, rho):
         theta_hat, z_hat = single_filter(y, eps, a, b, sigma)
         theta_mse, z_mse, joint_mse = mse_components(theta_true, z_true, theta_hat, z_hat, burnin=burnin)
@@ -346,11 +388,12 @@ def best_single_filter(y, theta_true, z_true, eps, rho, a, b, sigma, n_tau=50, b
         "z_mse": float(z_mse_arr[j]),
         "joint_mse": float(joint_mse_arr[j]),
     }
-    print(
-        f"    tau sweep batched n_tau={n_tau}: best_tau={best['best_tau']:0.5f} "
-        f"best_joint={best['joint_mse']:0.4f}",
-        flush=True,
-    )
+    if verbose:
+        print(
+            f"    tau sweep batched n_tau={n_tau}: best_tau={best['best_tau']:0.5f} "
+            f"best_joint={best['joint_mse']:0.4f}",
+            flush=True,
+        )
 
     return best
 
@@ -379,7 +422,7 @@ def summarize_metric(values):
     return mean, 1.96 * sem
 
 
-def run_single_instance(T, eps, rho, a, b, sigma, n_tau, seed, alpha=1.0, beta=1.0):
+def run_single_instance(T, eps, rho, a, b, sigma, n_tau, seed, alpha=1.0, beta=1.0, verbose=True):
     theta, z, y = simulate(T=T, eps=eps, rho=rho, a=a, b=b, sigma=sigma, seed=seed)
     burnin = int(1.0 / eps)
 
@@ -402,6 +445,7 @@ def run_single_instance(T, eps, rho, a, b, sigma, n_tau, seed, alpha=1.0, beta=1
         sigma=sigma,
         n_tau=n_tau,
         burnin=burnin,
+        verbose=verbose,
     )
     single_theta_hat, single_z_hat = single_filter(y, single["best_tau"], a, b, sigma)
     single_theta_cls, single_z_cls, single_weighted_cls = classification_error_components(
@@ -460,29 +504,78 @@ def aggregate_instances(rho, eps, runs):
     return result
 
 
-def run_sweep(T, eps, rhos, a, b, sigma, n_tau, base_seed, alpha=1.0, beta=1.0, n_seeds=1):
+def _pool_worker_init():
+    """One BLAS/OpenMP thread per worker so many processes do not oversubscribe."""
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+
+
+def _run_single_instance_packed(packed):
+    """Top-level wrapper for ProcessPoolExecutor (must be picklable on Windows)."""
+    T, eps, rho, a, b, sigma, n_tau, seed, alpha, beta = packed
+    return run_single_instance(
+        T, eps, rho, a, b, sigma, n_tau, seed, alpha, beta, verbose=False
+    )
+
+
+def resolve_workers(requested: int) -> int:
+    """0 -> min(12, CPU count); else max(1, requested)."""
+    ncpu = os.cpu_count() or 1
+    if requested <= 0:
+        return min(12, ncpu)
+    return max(1, int(requested))
+
+
+def run_sweep(
+    T,
+    eps,
+    rhos,
+    a,
+    b,
+    sigma,
+    n_tau,
+    base_seed,
+    alpha=1.0,
+    beta=1.0,
+    n_seeds=1,
+    workers=12,
+):
     results = []
+    w = resolve_workers(workers)
 
     for idx, rho in enumerate(rhos, start=1):
         print(f"[rho {idx:2d}/{len(rhos):2d}] lambda={rho / eps:0.2f} rho={rho:0.5f}", flush=True)
-        runs = []
-        for seed_offset in range(n_seeds):
-            seed = base_seed + idx * n_seeds + seed_offset
-            print(f"  seed {seed_offset + 1:2d}/{n_seeds:2d} (rng={seed})", flush=True)
-            runs.append(
-                run_single_instance(
-                    T=T,
-                    eps=eps,
-                    rho=rho,
-                    a=a,
-                    b=b,
-                    sigma=sigma,
-                    n_tau=n_tau,
-                    seed=seed,
-                    alpha=alpha,
-                    beta=beta,
+        seed0 = base_seed + idx * n_seeds
+        packed = [
+            (T, eps, rho, a, b, sigma, n_tau, seed0 + seed_offset, alpha, beta)
+            for seed_offset in range(n_seeds)
+        ]
+
+        if w == 1 or n_seeds == 1:
+            runs = []
+            for seed_offset in range(n_seeds):
+                seed = seed0 + seed_offset
+                print(f"  seed {seed_offset + 1:2d}/{n_seeds:2d} (rng={seed})", flush=True)
+                runs.append(
+                    run_single_instance(
+                        T=T,
+                        eps=eps,
+                        rho=rho,
+                        a=a,
+                        b=b,
+                        sigma=sigma,
+                        n_tau=n_tau,
+                        seed=seed,
+                        alpha=alpha,
+                        beta=beta,
+                        verbose=True,
+                    )
                 )
-            )
+        else:
+            pw = min(w, n_seeds)
+            print(f"  seeds 1..{n_seeds} parallel ({pw} worker{'s' if pw != 1 else ''})", flush=True)
+            with ProcessPoolExecutor(max_workers=pw, initializer=_pool_worker_init) as ex:
+                runs = list(ex.map(_run_single_instance_packed, packed))
 
         result = aggregate_instances(rho, eps, runs)
         results.append(result)
@@ -650,6 +743,13 @@ def parse_args():
     parser.add_argument("--n-tau", type=int, default=50, help="Number of tau values for the single-timescale sweep.")
     parser.add_argument("--seed", type=int, default=0, help="Base random seed for the rho sweep.")
     parser.add_argument("--n-seeds", type=int, default=1, help="Number of seeds to average per rho.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=12,
+        help="Parallel processes for the seed loop (1 = sequential with per-seed logs). "
+        "0 = min(12, CPU count). Capped at n-seeds per rho.",
+    )
     parser.add_argument("--alpha", type=float, default=1.0, help="Weight on theta classification loss.")
     parser.add_argument("--beta", type=float, default=1.0, help="Weight on z classification loss.")
     parser.add_argument(
@@ -678,6 +778,7 @@ def main():
         alpha=args.alpha,
         beta=args.beta,
         n_seeds=args.n_seeds,
+        workers=args.workers,
     )
 
     csv_path = args.output_prefix.with_suffix(".csv")
