@@ -232,6 +232,8 @@ def train_decoder(
     val_z=None,
     val_burnin=None,
     early_stopping_patience=0,
+    lr_schedule: str = "none",
+    lr_eta_min: float = 1e-5,
 ):
     """Train decoder on `inputs` only (beliefs c_t, or diagnostic y).
 
@@ -243,6 +245,13 @@ def train_decoder(
         device = torch.device("cpu")
     decoder = decoder.to(device)
     optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
+    sched = None
+    if lr_schedule == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=n_epochs, eta_min=lr_eta_min
+        )
+    elif lr_schedule not in ("none", ""):
+        raise ValueError(f"Unknown lr_schedule {lr_schedule!r}; use none or cosine.")
     loss_fn = nn.MSELoss()
 
     x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
@@ -276,6 +285,8 @@ def train_decoder(
         loss.backward()
         nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
         optimizer.step()
+        if sched is not None:
+            sched.step()
 
         if use_es:
             with torch.no_grad():
@@ -369,6 +380,8 @@ def run_rescue_sweep(
     base_seed,
     n_epochs=600,
     lr=1e-3,
+    lr_schedule="none",
+    lr_eta_min=1e-5,
     clock_periods=(1, 8, 64),
     hidden_dim=64,
     run_diagnostic_y_gru=True,
@@ -571,6 +584,8 @@ def run_rescue_sweep(
                     burnin=burnin,
                     device=device,
                     log_interval=log_interval,
+                    lr_schedule=lr_schedule,
+                    lr_eta_min=lr_eta_min,
                     **train_kw,
                 )
                 metrics = eval_decoder(
@@ -622,6 +637,8 @@ def run_rescue_sweep(
                     burnin=burnin,
                     device=device,
                     log_interval=log_interval,
+                    lr_schedule=lr_schedule,
+                    lr_eta_min=lr_eta_min,
                     **train_kw,
                 )
                 diag_y = eval_decoder(
@@ -661,6 +678,8 @@ def run_rescue_sweep(
                     burnin=burnin,
                     device=device,
                     log_interval=log_interval,
+                    lr_schedule=lr_schedule,
+                    lr_eta_min=lr_eta_min,
                     **train_kw,
                 )
                 diag_dual = eval_decoder(
@@ -1057,6 +1076,8 @@ def build_rescue_config_signature(
     early_stopping_patience: int,
     torch_compile: bool,
     device_str: str,
+    lr_schedule: str = "none",
+    lr_eta_min: float = 1e-5,
 ) -> dict:
     """Stable dict for resume validation (must match exactly)."""
     return {
@@ -1072,6 +1093,8 @@ def build_rescue_config_signature(
         "base_seed": int(base_seed),
         "n_epochs": int(n_epochs),
         "lr": float(lr),
+        "lr_schedule": str(lr_schedule),
+        "lr_eta_min": float(lr_eta_min),
         "clock_periods": [int(x) for x in clock_periods],
         "hidden_dim": int(hidden_dim),
         "run_diagnostic_y_gru": bool(run_diagnostic_y_gru),
@@ -1115,6 +1138,8 @@ def load_rescue_checkpoint(path: Path, expected_config: dict) -> tuple[list, int
     if raw.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(f"Unknown checkpoint format in {path}")
     cfg = raw["config"]
+    cfg.setdefault("lr_schedule", "none")
+    cfg.setdefault("lr_eta_min", 1e-5)
     if not _configs_match(cfg, expected_config):
         raise ValueError(
             "Checkpoint config does not match this run (T, rhos, seeds, epochs, etc.). "
@@ -1224,6 +1249,19 @@ def parse_args():
         type=float,
         default=1e-3,
         help="Adam learning rate for all decoders. Try 3e-3 if loss is still falling at epoch end.",
+    )
+    p.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="none",
+        choices=("none", "cosine"),
+        help="Learning-rate schedule: none, or cosine annealing to --lr-eta-min over n-epochs.",
+    )
+    p.add_argument(
+        "--lr-eta-min",
+        type=float,
+        default=1e-5,
+        help="Minimum LR when --lr-schedule cosine (PyTorch CosineAnnealingLR).",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -1387,6 +1425,8 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         torch_compile=args.torch_compile,
         device_str=str(device),
+        lr_schedule=args.lr_schedule,
+        lr_eta_min=args.lr_eta_min,
     )
 
     results = run_rescue_sweep(
@@ -1401,6 +1441,8 @@ def main():
         base_seed=args.seed,
         n_epochs=args.n_epochs,
         lr=args.lr,
+        lr_schedule=args.lr_schedule,
+        lr_eta_min=args.lr_eta_min,
         clock_periods=clock_periods,
         hidden_dim=hidden_dim,
         run_diagnostic_y_gru=not args.no_diagnostic_y,
