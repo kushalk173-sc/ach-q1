@@ -25,6 +25,9 @@ Use `--epoch-log-interval 0` to reduce logging overhead.
 (completed rho rows + in-progress seeds). If the run stops, re-launch with the same
 arguments plus `--resume`. Finished runs delete the checkpoint. Use `--fresh-start`
 to ignore an old checkpoint, or `--no-checkpoint` to disable.
+
+**Progress:** `python rescue_decoder.py --report-checkpoint YOUR.checkpoint.json`
+prints how many rho values are done and optional `--report-plot partial.png` for curves.
 """
 
 import argparse
@@ -758,11 +761,13 @@ def _ci_band(y, ci):
     return y - ci, y + ci
 
 
-def make_rescue_plot(results, output_path):
+def make_rescue_plot(results, output_path, suptitle_note: str = ""):
     lambdas = np.array([r["lambda"] for r in results])
     r0 = results[0] if results else {}
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+    if suptitle_note:
+        fig.suptitle(suptitle_note, fontsize=12, y=1.01)
 
     # Row 0 left: MSE + 95% CI bands
     ax = axes[0, 0]
@@ -969,7 +974,7 @@ def make_rescue_plot(results, output_path):
         ax.set_title(title)
         ax.legend(fontsize=7)
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.98 if suptitle_note else 1))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
     print(f"Saved to {output_path}")
@@ -1123,6 +1128,63 @@ def load_rescue_checkpoint(path: Path, expected_config: dict) -> tuple[list, int
     return completed, None, None
 
 
+def load_checkpoint_raw(path: Path) -> dict:
+    """Load checkpoint JSON without config validation (for --report-checkpoint)."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError(
+            f"{path} is not a rescue_decoder checkpoint (expected format={CHECKPOINT_FORMAT!r})."
+        )
+    return raw
+
+
+def report_checkpoint_progress(path: Path, plot_path: Path | None = None) -> None:
+    """Print human-readable progress from a checkpoint file; optionally save partial plot."""
+    raw = load_checkpoint_raw(path)
+    cfg = raw["config"]
+    rhos = cfg.get("rhos") or []
+    done = raw.get("completed_results") or []
+    pr = raw.get("partial_rho_idx")
+    ps = raw.get("partial_seed_rows")
+
+    print(f"Checkpoint file: {path.resolve()}")
+    print(f"  T={cfg.get('T')}, n_epochs={cfg.get('n_epochs')}, n_seeds={cfg.get('n_seeds')}, device={cfg.get('device_str')}")
+    print(f"  Full rho grid: {len(rhos)} values (lambda = rho/eps)")
+    print(f"  Completed rho rows (aggregated): {len(done)}")
+    if done:
+        lam0, lam1 = float(done[0]["lambda"]), float(done[-1]["lambda"])
+        print(f"  Lambda range covered so far: {lam0:.6g} .. {lam1:.6g}")
+        last = done[-1]
+        gap = float(last["single_mse"]) - float(last["dual_mse"])
+        print(
+            f"  Last row: dual_joint={float(last['dual_mse']):.4f}  "
+            f"single_joint={float(last['single_mse']):.4f}  "
+            f"gap={gap:.4f}"
+        )
+    n_seeds = int(cfg.get("n_seeds", 1))
+    if pr is not None and ps is not None:
+        print(
+            f"  In progress: rho index {pr} (grid position {pr + 1}/{len(rhos)}), "
+            f"seeds finished for this rho: {len(ps)}/{n_seeds}"
+        )
+    elif len(done) < len(rhos):
+        print(
+            f"  Remaining rho values: {len(rhos) - len(done)} "
+            f"(next grid index {len(done)})"
+        )
+    else:
+        print("  All rho rows in grid appear complete (or checkpoint is stale).")
+
+    if plot_path is not None:
+        if not done:
+            print("  --report-plot: skipped (no completed rows to plot).")
+        else:
+            plot_path.parent.mkdir(parents=True, exist_ok=True)
+            note = f"Partial progress ({len(done)}/{len(rhos)} rho values) — checkpoint"
+            make_rescue_plot(done, plot_path, suptitle_note=note)
+            print(f"  Wrote partial plot: {plot_path.resolve()}")
+
+
 def build_param_counts(hidden_dim, clock_periods, gru_matched_hidden: int):
     return {
         "one_pole": count_parameters(
@@ -1252,11 +1314,28 @@ def parse_args():
         action="store_true",
         help="Delete checkpoint file before running (discard partial progress).",
     )
+    p.add_argument(
+        "--report-checkpoint",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Load checkpoint JSON, print progress summary, and exit (see --report-plot).",
+    )
+    p.add_argument(
+        "--report-plot",
+        type=Path,
+        default=None,
+        help="With --report-checkpoint, save partial multi-panel PNG to this path.",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.report_checkpoint is not None:
+        report_checkpoint_progress(args.report_checkpoint, args.report_plot)
+        return
+
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     rhos = np.logspace(np.log10(args.eps), np.log10(args.rho_max), args.n_rho)
 
