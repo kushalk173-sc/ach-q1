@@ -28,12 +28,17 @@ to ignore an old checkpoint, or `--no-checkpoint` to disable.
 
 **Progress:** `python rescue_decoder.py --report-checkpoint YOUR.checkpoint.json`
 prints how many rho values are done and optional `--report-plot partial.png` for curves.
+
+**Multi-seq training:** use `--train-n-seq 64` (and `--train-seq-len`, default 400 so slow θ
+sees several switches per segment when eps≈0.01). Eval stays one long held-out sequence.
+`--train-n-seq 0` keeps the legacy single long training sequence.
 """
 
 import argparse
 import json
 import os
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -56,6 +61,14 @@ from filter_race_experiment import (
 
 def count_parameters(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
+
+
+def training_burnin_short(long_burnin: int, seq_len: int) -> int:
+    """Burn-in for short training segments (cannot use full 1/eps if T is small)."""
+    if seq_len <= 1:
+        return 0
+    b = min(int(long_burnin), max(5, seq_len // 5))
+    return min(b, seq_len - max(4, seq_len // 10))
 
 
 def resolve_device(name: str) -> torch.device:
@@ -123,19 +136,34 @@ class OnePoleDecoder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, beliefs):
-        # beliefs: (T, input_dim) — vectorized input proj; EMA recurrence in-loop
+        # beliefs: (T, input_dim) or (B, T, input_dim)
+        if beliefs.dim() == 2:
+            x = torch.tanh(self.input_proj(beliefs))
+            T, _ = x.shape
+            device, dtype = x.device, x.dtype
+            h = torch.zeros(self.hidden_dim, device=device, dtype=dtype)
+            alpha = torch.as_tensor(self.alpha, device=device, dtype=dtype)
+            one_m_a = 1.0 - alpha
+            theta_out = torch.empty(T, device=device, dtype=dtype)
+            z_out = torch.empty(T, device=device, dtype=dtype)
+            for t in range(T):
+                h = alpha * h + one_m_a * x[t]
+                theta_out[t] = self.output_theta(h).squeeze(-1)
+                z_out[t] = self.output_z(h).squeeze(-1)
+            return theta_out, z_out
+
         x = torch.tanh(self.input_proj(beliefs))
-        T, _ = x.shape
+        B, T, _ = x.shape
         device, dtype = x.device, x.dtype
-        h = torch.zeros(self.hidden_dim, device=device, dtype=dtype)
+        h = torch.zeros(B, self.hidden_dim, device=device, dtype=dtype)
         alpha = torch.as_tensor(self.alpha, device=device, dtype=dtype)
         one_m_a = 1.0 - alpha
-        theta_out = torch.empty(T, device=device, dtype=dtype)
-        z_out = torch.empty(T, device=device, dtype=dtype)
+        theta_out = torch.empty(B, T, device=device, dtype=dtype)
+        z_out = torch.empty(B, T, device=device, dtype=dtype)
         for t in range(T):
-            h = alpha * h + one_m_a * x[t]
-            theta_out[t] = self.output_theta(h).squeeze(-1)
-            z_out[t] = self.output_z(h).squeeze(-1)
+            h = alpha * h + one_m_a * x[:, t, :]
+            theta_out[:, t] = self.output_theta(h).squeeze(-1)
+            z_out[:, t] = self.output_z(h).squeeze(-1)
         return theta_out, z_out
 
 
@@ -156,9 +184,12 @@ class GRUDecoder(nn.Module):
         self.output_z = nn.Linear(hidden_dim, 1)
 
     def forward(self, seq):
-        # seq: (T, input_dim) -> (1, T, input_dim) for batch_first GRU
-        out, _ = self.gru(seq.unsqueeze(0))
-        out = out.squeeze(0)  # (T, hidden)
+        # seq: (T, input_dim) or (B, T, input_dim)
+        if seq.dim() == 2:
+            out, _ = self.gru(seq.unsqueeze(0))
+            out = out.squeeze(0)
+        else:
+            out, _ = self.gru(seq)
         return self.output_theta(out).squeeze(-1), self.output_z(out).squeeze(-1)
 
 
@@ -196,12 +227,28 @@ class ClockworkDecoder(nn.Module):
         self.actual_hidden = actual_hidden
 
     def forward(self, beliefs):
-        T = beliefs.shape[0]
-        h = torch.zeros(self.actual_hidden, device=beliefs.device)
+        if beliefs.dim() == 2:
+            T = beliefs.shape[0]
+            h = torch.zeros(self.actual_hidden, device=beliefs.device, dtype=beliefs.dtype)
+            inp_all = self.input_proj(beliefs)
+            theta_out, z_out = [], []
+            for t in range(T):
+                rh = self.recurrent(h)
+                new_h = h.clone()
+                for g, period in enumerate(self.clock_periods):
+                    if t % period == 0:
+                        s = g * self.group_size
+                        e = s + self.group_size
+                        new_h[s:e] = torch.tanh(inp_all[t, s:e] + rh[s:e])
+                h = new_h
+                theta_out.append(self.output_theta(h))
+                z_out.append(self.output_z(h))
+            return torch.stack(theta_out).squeeze(-1), torch.stack(z_out).squeeze(-1)
+
+        B, T, _ = beliefs.shape
+        h = torch.zeros(B, self.actual_hidden, device=beliefs.device, dtype=beliefs.dtype)
+        inp_all = self.input_proj(beliefs)
         theta_out, z_out = [], []
-
-        inp_all = self.input_proj(beliefs)  # (T, hidden); nonlinearity only in-loop
-
         for t in range(T):
             rh = self.recurrent(h)
             new_h = h.clone()
@@ -209,12 +256,13 @@ class ClockworkDecoder(nn.Module):
                 if t % period == 0:
                     s = g * self.group_size
                     e = s + self.group_size
-                    new_h[s:e] = torch.tanh(inp_all[t, s:e] + rh[s:e])
+                    new_h[:, s:e] = torch.tanh(inp_all[:, t, s:e] + rh[:, s:e])
             h = new_h
             theta_out.append(self.output_theta(h))
             z_out.append(self.output_z(h))
-
-        return torch.stack(theta_out).squeeze(-1), torch.stack(z_out).squeeze(-1)
+        th = torch.stack(theta_out, dim=1).squeeze(-1)
+        zz = torch.stack(z_out, dim=1).squeeze(-1)
+        return th, zz
 
 
 def train_decoder(
@@ -234,8 +282,13 @@ def train_decoder(
     early_stopping_patience=0,
     lr_schedule: str = "none",
     lr_eta_min: float = 1e-5,
+    train_batch_fn: Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None = None,
 ):
     """Train decoder on `inputs` only (beliefs c_t, or diagnostic y).
+
+    If ``train_batch_fn`` is set, each epoch calls ``train_batch_fn(epoch_index)``
+    and must return ``(xb, thb, zb, burnin_short)`` with shapes
+    ``(B, L, C), (B, L), (B, L)`` — independent short sequences for generalization.
 
     If ``val_inputs`` is set and ``early_stopping_patience > 0``, train only on
     ``inputs`` and use the validation sequence for checkpoint selection (lowest
@@ -254,9 +307,12 @@ def train_decoder(
         raise ValueError(f"Unknown lr_schedule {lr_schedule!r}; use none or cosine.")
     loss_fn = nn.MSELoss()
 
-    x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
-    th_t = torch.as_tensor(theta_true, dtype=torch.float32, device=device)
-    z_t = torch.as_tensor(z_true, dtype=torch.float32, device=device)
+    if train_batch_fn is None:
+        x_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
+        th_t = torch.as_tensor(theta_true, dtype=torch.float32, device=device)
+        z_t = torch.as_tensor(z_true, dtype=torch.float32, device=device)
+    else:
+        x_t = th_t = z_t = None  # set per epoch
 
     use_es = (
         val_inputs is not None
@@ -277,11 +333,25 @@ def train_decoder(
 
     decoder.train()
     for epoch in range(n_epochs):
+        if train_batch_fn is not None:
+            x_np, th_np, z_np, b_short = train_batch_fn(epoch)
+            x_t = torch.as_tensor(x_np, dtype=torch.float32, device=device)
+            th_t = torch.as_tensor(th_np, dtype=torch.float32, device=device)
+            z_t = torch.as_tensor(z_np, dtype=torch.float32, device=device)
+            opt_b = b_short
+        else:
+            opt_b = burnin
+
         optimizer.zero_grad()
         th_pred, z_pred = decoder(x_t)
-        loss = loss_fn(th_pred[burnin:], th_t[burnin:]) + loss_fn(
-            z_pred[burnin:], z_t[burnin:]
-        )
+        if train_batch_fn is not None:
+            loss = loss_fn(th_pred[:, opt_b:], th_t[:, opt_b:]) + loss_fn(
+                z_pred[:, opt_b:], z_t[:, opt_b:]
+            )
+        else:
+            loss = loss_fn(th_pred[burnin:], th_t[burnin:]) + loss_fn(
+                z_pred[burnin:], z_t[burnin:]
+            )
         loss.backward()
         nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
         optimizer.step()
@@ -395,6 +465,8 @@ def run_rescue_sweep(
     checkpoint_path=None,
     resume=False,
     config_signature=None,
+    train_n_seq=0,
+    train_seq_len=400,
 ):
     """
     For each rho value:
@@ -542,6 +614,80 @@ def run_rescue_sweep(
                 z_fit = z_tr
                 train_kw = {}
 
+            if train_n_seq > 0:
+                Ltr = train_seq_len
+                if training_burnin_short(burnin, Ltr) >= Ltr - 1:
+                    raise ValueError(
+                        f"train_seq_len={Ltr} too small for burnin≈{burnin}; "
+                        "increase --train-seq-len or reduce eps."
+                    )
+                print(
+                    f"  Multi-seq training: {train_n_seq} seqs x {Ltr} steps/epoch "
+                    f"(burnin_short={training_burnin_short(burnin, Ltr)})",
+                    flush=True,
+                )
+
+                def protocol_train_batch(epoch_idx: int):
+                    base = seed_tr + 1_000_007 * (epoch_idx + 1) + s * 10_009
+                    bels, ths, zs = [], [], []
+                    for ii in range(train_n_seq):
+                        th_i, z_i, y_i = simulate(
+                            Ltr, eps, rho, a, b, sigma, seed=base + ii * 97
+                        )
+                        _, _, b_i = single_filter_with_beliefs(
+                            y_i, tau_star, a, b, sigma
+                        )
+                        bels.append(b_i.astype(np.float32))
+                        ths.append(th_i.astype(np.float32))
+                        zs.append(z_i.astype(np.float32))
+                    return (
+                        np.stack(bels, axis=0),
+                        np.stack(ths, axis=0),
+                        np.stack(zs, axis=0),
+                        training_burnin_short(burnin, Ltr),
+                    )
+
+                def diag_y_train_batch(epoch_idx: int):
+                    base = seed_tr + 2_000_011 * (epoch_idx + 1) + s * 10_019
+                    ys, ths, zs = [], [], []
+                    for ii in range(train_n_seq):
+                        th_i, z_i, y_i = simulate(
+                            Ltr, eps, rho, a, b, sigma, seed=base + ii * 97
+                        )
+                        ys.append(y_i.reshape(-1, 1).astype(np.float32))
+                        ths.append(th_i.astype(np.float32))
+                        zs.append(z_i.astype(np.float32))
+                    return (
+                        np.stack(ys, axis=0),
+                        np.stack(ths, axis=0),
+                        np.stack(zs, axis=0),
+                        training_burnin_short(burnin, Ltr),
+                    )
+
+                def diag_dual_train_batch(epoch_idx: int):
+                    base = seed_tr + 3_000_013 * (epoch_idx + 1) + s * 10_029
+                    bels, ths, zs = [], [], []
+                    for ii in range(train_n_seq):
+                        th_i, z_i, y_i = simulate(
+                            Ltr, eps, rho, a, b, sigma, seed=base + ii * 97
+                        )
+                        _, _, bd = dual_filter_with_beliefs(
+                            y_i, eps, rho, a, b, sigma
+                        )
+                        bels.append(bd.astype(np.float32))
+                        ths.append(th_i.astype(np.float32))
+                        zs.append(z_i.astype(np.float32))
+                    return (
+                        np.stack(bels, axis=0),
+                        np.stack(ths, axis=0),
+                        np.stack(zs, axis=0),
+                        training_burnin_short(burnin, Ltr),
+                    )
+            else:
+                protocol_train_batch = None
+                diag_y_train_batch = None
+                diag_dual_train_batch = None
+
             def set_torch_seed(name: str) -> None:
                 off = {
                     "one_pole": 11,
@@ -586,6 +732,7 @@ def run_rescue_sweep(
                     log_interval=log_interval,
                     lr_schedule=lr_schedule,
                     lr_eta_min=lr_eta_min,
+                    train_batch_fn=protocol_train_batch,
                     **train_kw,
                 )
                 metrics = eval_decoder(
@@ -627,11 +774,13 @@ def run_rescue_sweep(
                 diag_dec = diag_dec.to(device)
                 if torch_compile and hasattr(torch, "compile"):
                     diag_dec = torch.compile(diag_dec)  # type: ignore[assignment]
+                # Full-length targets (match y_seq_tr / y_tr); do not use theta_fit when
+                # val_frac splits protocol training — diagnostics skip early-stopping train_kw.
                 train_decoder(
                     diag_dec,
                     y_seq_tr,
-                    theta_fit,
-                    z_fit,
+                    theta_tr.astype(np.float32),
+                    z_tr.astype(np.float32),
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
@@ -639,7 +788,7 @@ def run_rescue_sweep(
                     log_interval=log_interval,
                     lr_schedule=lr_schedule,
                     lr_eta_min=lr_eta_min,
-                    **train_kw,
+                    train_batch_fn=diag_y_train_batch,
                 )
                 diag_y = eval_decoder(
                     diag_dec,
@@ -671,8 +820,8 @@ def run_rescue_sweep(
                 train_decoder(
                     dd,
                     b_dual_tr,
-                    theta_fit,
-                    z_fit,
+                    theta_tr.astype(np.float32),
+                    z_tr.astype(np.float32),
                     n_epochs=n_epochs,
                     lr=lr,
                     burnin=burnin,
@@ -680,7 +829,7 @@ def run_rescue_sweep(
                     log_interval=log_interval,
                     lr_schedule=lr_schedule,
                     lr_eta_min=lr_eta_min,
-                    **train_kw,
+                    train_batch_fn=diag_dual_train_batch,
                 )
                 diag_dual = eval_decoder(
                     dd, b_dual_ev, theta_ev, z_ev, burnin=burnin, device=device
@@ -1078,6 +1227,8 @@ def build_rescue_config_signature(
     device_str: str,
     lr_schedule: str = "none",
     lr_eta_min: float = 1e-5,
+    train_n_seq: int = 0,
+    train_seq_len: int = 400,
 ) -> dict:
     """Stable dict for resume validation (must match exactly)."""
     return {
@@ -1104,6 +1255,8 @@ def build_rescue_config_signature(
         "early_stopping_patience": int(early_stopping_patience),
         "torch_compile": bool(torch_compile),
         "device_str": str(device_str),
+        "train_n_seq": int(train_n_seq),
+        "train_seq_len": int(train_seq_len),
     }
 
 
@@ -1114,6 +1267,16 @@ def _configs_match(a: dict, b: dict) -> bool:
         if a[k] != b[k]:
             return False
     return True
+
+
+def _configs_match_for_resume(stored: dict, expected: dict) -> bool:
+    """Resume check; ``train_seq_len`` is unused when ``train_n_seq==0`` on both sides."""
+    a = dict(stored)
+    b = dict(expected)
+    if int(a.get("train_n_seq", 0)) == 0 and int(b.get("train_n_seq", 0)) == 0:
+        a.pop("train_seq_len", None)
+        b.pop("train_seq_len", None)
+    return _configs_match(a, b)
 
 
 def save_rescue_checkpoint(
@@ -1140,7 +1303,9 @@ def load_rescue_checkpoint(path: Path, expected_config: dict) -> tuple[list, int
     cfg = raw["config"]
     cfg.setdefault("lr_schedule", "none")
     cfg.setdefault("lr_eta_min", 1e-5)
-    if not _configs_match(cfg, expected_config):
+    cfg.setdefault("train_n_seq", 0)
+    cfg.setdefault("train_seq_len", 400)
+    if not _configs_match_for_resume(cfg, expected_config):
         raise ValueError(
             "Checkpoint config does not match this run (T, rhos, seeds, epochs, etc.). "
             "Use the same CLI as when the checkpoint was written, or delete the checkpoint file."
@@ -1262,6 +1427,20 @@ def parse_args():
         type=float,
         default=1e-5,
         help="Minimum LR when --lr-schedule cosine (PyTorch CosineAnnealingLR).",
+    )
+    p.add_argument(
+        "--train-n-seq",
+        type=int,
+        default=0,
+        help="If >0, train each decoder on this many independent short sequences per epoch "
+        "(reduces single-trajectory memorization). 0 = one full training sequence (legacy).",
+    )
+    p.add_argument(
+        "--train-seq-len",
+        type=int,
+        default=400,
+        help="Length of each short training sequence when --train-n-seq > 0. "
+        "Use ~4×(1/eps) or more so slow θ has several switches per segment (eps=0.01 → ≥400).",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -1427,6 +1606,8 @@ def main():
         device_str=str(device),
         lr_schedule=args.lr_schedule,
         lr_eta_min=args.lr_eta_min,
+        train_n_seq=args.train_n_seq,
+        train_seq_len=args.train_seq_len,
     )
 
     results = run_rescue_sweep(
@@ -1456,6 +1637,8 @@ def main():
         checkpoint_path=ck_path,
         resume=args.resume,
         config_signature=config_signature if ck_path is not None else None,
+        train_n_seq=args.train_n_seq,
+        train_seq_len=args.train_seq_len,
     )
 
     meta = {
@@ -1473,6 +1656,8 @@ def main():
         "hidden_dim": hidden_dim,
         "clock_periods": list(clock_periods),
         "gru_num_layers": 2,
+        "train_n_seq": args.train_n_seq,
+        "train_seq_len": args.train_seq_len,
         "protocol_note": (
             "OnePole = admissible single-timescale rescue. GRU and Clockwork at "
             "the same hidden_dim are stress tests (different parameter counts; "
